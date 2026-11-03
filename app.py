@@ -10,15 +10,22 @@ import sqlite3
 import hashlib
 import json
 import zipfile
+import threading
+import shlex
+import time
+import html
+import signal
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
 import aiohttp
 from pathlib import Path
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
+from persistence import Persistence
+from customer_dbs import CustomerDBs, load_servers_from_env, LABELS, EMOJI
 
 load_dotenv()
 
@@ -184,6 +191,23 @@ def load_data():
     except Exception as e:
         logger.error(f"Error loading data: {e}", exc_info=True)
 
+# -- EXTERNAL STORAGE (MongoDB) ---------------------------------------------------------
+# Restores the SQLite database + all customer files from MongoDB BEFORE the database is opened,
+# so a Render redeploy/restart no longer wipes anything. Disabled (with a warning) if MONGO_URI is empty.
+_pool_urls = load_servers_from_env(os.environ)
+_default_max = os.getenv('DB_MAX_PER_SERVER')
+customers = CustomerDBs(DATABASE_PATH, _pool_urls, secret=os.getenv('DB_SECRET', ''),
+                        max_per_server={e: int(os.getenv(f'{e.upper()}_MAX_PER_SERVER', _default_max or '0') or 0)
+                                        for e in ('mongo', 'mysql', 'postgres')})
+persist = Persistence(
+    uri=os.getenv('MONGO_URI'),
+    db_name=os.getenv('MONGO_DB_NAME', 'hostbot'),
+    upload_dir=UPLOAD_BOTS_DIR,
+    sqlite_path=DATABASE_PATH,
+    customer=customers,
+)
+persist.restore_all()
+
 init_db()
 migrate_db()
 load_data()
@@ -209,6 +233,7 @@ IMPORT_TO_PIP = {
     'youtube_dl': 'youtube-dl',
     'sklearn': 'scikit-learn',
     'websocket': 'websocket-client',
+    'mysql': 'mysql-connector-python',
     'serial': 'pyserial',
 }
 
@@ -292,6 +317,9 @@ def get_main_keyboard(user_id):
          InlineKeyboardButton(text="📁 My Files", callback_data="check_files")],
         [InlineKeyboardButton(text="🔍 Search Files", callback_data="search_files"),
          InlineKeyboardButton(text="⚡ Bot Speed", callback_data="bot_speed")],
+        [InlineKeyboardButton(text="💾 My Backup", callback_data="my_backup"),
+         InlineKeyboardButton(text="🗄️ My Database", callback_data="my_database")],
+        [InlineKeyboardButton(text="🖥️ Terminal", callback_data="terminal_help")],
     ]
     if user_id in admin_ids:
         rows.append([InlineKeyboardButton(text="📊 My Stats", callback_data="statistics"),
@@ -360,6 +388,20 @@ async def cmd_start(message: types.Message):
     except Exception as e:
         logger.error(f"Error saving active user: {e}")
     
+    # Round robin: the 1st customer goes to database server 1, the 2nd to server 2, ... then back to server 1.
+    if customers.enabled and customers.assigned_index(user_id) is None:
+        idx = await asyncio.to_thread(customers.assign, user_id)
+        if idx is None:
+            customers.pop_error(user_id)
+            try:
+                await bot.send_message(OWNER_ID, "⚠️ <b>No database server available.</b> A new customer could not be given "
+                                                 "a database (all servers full or offline). Check /dbstats and your "
+                                                 "CUSTOMER_DB_* variables.", parse_mode="HTML")
+            except Exception:
+                pass
+        else:
+            await _persist_now()
+
     welcome_text = build_welcome_text(user_id, message.from_user.full_name)
     await message.answer(welcome_text, reply_markup=get_main_keyboard(user_id), parse_mode="HTML")
 
@@ -400,9 +442,14 @@ async def callback_upload_file(callback: types.CallbackQuery):
 📊 <b>Current Usage:</b> {current_files} files (Unlimited ♾️)
 
 📝 <b>Supported Formats:</b>
-🐍 Python (.py)
-🟨 JavaScript (.js)
+🐍 Python (.py)  ·  🟨 JavaScript (.js)
 📦 ZIP Archives (.zip)
+📋 <code>requirements.txt</code> → packages are installed for you
+📋 <code>package.json</code> → npm packages are installed for you
+🔐 <code>.env</code> → your secrets/settings for your bot
+🖥️ Terminal: /term (pip install, ls, python bot.py ...)
+
+▶️ .py / .js files <b>start automatically</b> once uploaded.
 
 ━━━━━━━━━━━━━━━━━━━━
 <b>💡 How to Upload:</b>
@@ -886,11 +933,16 @@ async def handle_document(message: types.Message):
         return
     
     document = message.document
-    file_name = document.file_name
+    file_name = os.path.basename((document.file_name or '').replace('\\', '/')) or 'file'
     file_ext = os.path.splitext(file_name)[1].lower()
+
+    special = _special_kind(file_name)
+    if special:
+        await _handle_special_upload(message, document, special)
+        return
     
     if file_ext not in ['.py', '.js', '.zip']:
-        await message.answer("❌ Only .py, .js, and .zip files are supported!")
+        await message.answer("❌ Supported files: .py, .js, .zip, requirements.txt, package.json and .env")
         return
     
     current_files = len(user_files.get(user_id, []))
@@ -950,6 +1002,7 @@ async def handle_document(message: types.Message):
         conn.close()
         
         bot_stats['total_uploads'] = bot_stats.get('total_uploads', 0) + 1
+        await _persist_now(user_id)
         
         await status_msg.edit_text(
             f"✅ <b>Finalizing...</b>\n\n"
@@ -996,6 +1049,12 @@ async def handle_document(message: types.Message):
             reply_markup=keyboard,
             parse_mode="HTML"
         )
+
+        if file_ext in ('.py', '.js'):
+            try:
+                await _auto_run_after_upload(message, user_id, file_name)
+            except Exception as auto_err:
+                logger.error(f"auto-run failed: {auto_err}", exc_info=True)
     except Exception as e:
         logger.error(f"Error uploading file: {e}")
         await message.answer(f"❌ Upload failed: {str(e)}")
@@ -1008,14 +1067,50 @@ _starting_scripts = set()  # script keys that are being launched right now
 _HOST_ONLY_ENV = (
     'BOT_TOKEN', 'OWNER_ID', 'ADMIN_ID', 'ADMIN_PASSWORD', 'UPDATE_CHANNEL', 'YOUR_USERNAME',
     'PORT', 'RENDER_EXTERNAL_URL', 'DATABASE_PATH', 'WEB_CONCURRENCY',
+    'MONGO_URI', 'MONGO_DB_NAME', 'PERSIST_MAX_FILE_MB', 'DB_SECRET', 'DB_MAX_PER_SERVER',
+    'MONGO_MAX_PER_SERVER', 'MYSQL_MAX_PER_SERVER', 'POSTGRES_MAX_PER_SERVER',
 )
 
-def _child_env():
+def _child_env(user_id=None):
     env = os.environ.copy()
     for k in _HOST_ONLY_ENV:
         env.pop(k, None)
     env['PYTHONUNBUFFERED'] = '1'
+    # never leak the pool's admin logins to a customer's script
+    for k in list(env):
+        if k.startswith('CUSTOMER_MONGO_URI') or k.startswith('CUSTOMER_MYSQL_URL') \
+                or k.startswith('CUSTOMER_POSTGRES_URL') or k.startswith('CUSTOMER_DB_'):
+            env.pop(k, None)
+    # Private databases for this customer's bot (MONGO_* / MYSQL_*), as chosen in "My Database".
+    # Blocking (may create the MySQL user), so call it with asyncio.to_thread.
+    if user_id is not None:
+        env.update(customers.env_for(user_id))
+        env.update(_user_dotenv(user_id))
+        packages = UPLOAD_BOTS_DIR / str(user_id) / '.packages'
+        if packages.is_dir():      # the customer's own pip packages (requirements.txt), isolated from the host
+            env['PYTHONPATH'] = str(packages)
     return env
+
+# -- CLOUD STORAGE HELPERS ----------------------------------------------------------------
+_stopping = set()      # script keys the user/admin stopped on purpose (so they are not treated as crashes)
+_last_backup = {}      # script key -> time of last crash backup (cooldown)
+
+def _bg(fn, *args):
+    threading.Thread(target=fn, args=args, daemon=True).start()
+
+def _note_stop(script_key):
+    """A script was stopped on purpose: do not restart it after a host restart, do not report a crash."""
+    _stopping.add(script_key)
+    _bg(persist.clear_running, script_key)
+
+async def _persist_now(user_id=None):
+    """Push the latest files + database to MongoDB right away (never raises)."""
+    try:
+        if user_id is not None:
+            await asyncio.to_thread(persist.sync_user, user_id)
+        await asyncio.to_thread(persist.snapshot_db)
+    except Exception as e:
+        logger.error(f"persist_now failed: {e}")
 
 def _terminate_tree(pid, grace=3):
     """Terminate a process and all its children, then kill whatever is still alive."""
@@ -1046,6 +1141,7 @@ def _reap_dead_scripts():
                 if lf and not lf.closed:
                     lf.close()
                 del bot_scripts[key]
+                _bg(persist.clear_running, key)
         except Exception:
             bot_scripts.pop(key, None)
 
@@ -1100,12 +1196,15 @@ async def callback_run_script(callback: types.CallbackQuery):
 
     # Lock immediately so a second tap cannot start a duplicate copy, and answer the tap right away.
     _starting_scripts.add(script_key)
+    _stopping.discard(script_key)
     log_file = None
     try:
         await callback.answer("⏳ Starting your script, please wait...")
 
         log_file_path = user_folder / f"{file_path.stem}.log"
         log_file = open(log_file_path, 'w')
+
+        await asyncio.to_thread(_ensure_dependencies, user_folder)
 
         status_msg = None
         if file_ext == '.py':
@@ -1126,12 +1225,13 @@ async def callback_run_script(callback: types.CallbackQuery):
         await asyncio.to_thread(_kill_orphans, file_path)
 
         cmd = [sys.executable, '-u', str(file_path)] if file_ext == '.py' else ['node', str(file_path)]
+        child_env = await asyncio.to_thread(_child_env, user_id)
         process = subprocess.Popen(
             cmd,
             cwd=str(user_folder),
             stdout=log_file,
             stderr=log_file,
-            env=_child_env(),
+            env=child_env,
         )
 
         bot_scripts[script_key] = {
@@ -1150,6 +1250,7 @@ async def callback_run_script(callback: types.CallbackQuery):
         conn.commit()
         conn.close()
         bot_stats['total_runs'] = bot_stats.get('total_runs', 0) + 1
+        _bg(persist.mark_running, script_key, user_id, file_name)
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🛑 Stop Script", callback_data=f"stop_script:{script_key}")],
@@ -1160,6 +1261,9 @@ async def callback_run_script(callback: types.CallbackQuery):
         await callback.message.answer(
             f"✅ <b>{file_name}</b> started! (PID: {process.pid})",
             reply_markup=keyboard, parse_mode="HTML")
+        db_warning = customers.pop_error(user_id)
+        if db_warning:
+            await callback.message.answer(db_warning)
 
     except Exception as e:
         logger.error(f"Error running script: {e}")
@@ -1228,6 +1332,7 @@ async def callback_stop_script(callback: types.CallbackQuery):
         if log_file and not log_file.closed:
             log_file.close()
         
+        _note_stop(script_key)
         await asyncio.to_thread(_terminate_tree, process.pid)
 
         bot_scripts.pop(script_key, None)
@@ -1330,6 +1435,7 @@ Please wait...
         
         if zip_path.exists():
             zip_path.unlink()
+        await _persist_now(user_id)
         
         registered_text = "\n".join([f"  • <code>{f}</code>" for f in registered_files[:10]])
         if len(registered_files) > 10:
@@ -1396,6 +1502,7 @@ async def callback_delete_file(callback: types.CallbackQuery):
         c.execute('DELETE FROM favorites WHERE user_id = ? AND file_name = ?', (user_id, file_name))
         conn.commit()
         conn.close()
+        await _persist_now(user_id)
         
         await callback.answer("✅ File deleted successfully!", show_alert=True)
         await callback_check_files(callback)
@@ -2365,6 +2472,7 @@ def _stop_script(key):
     info = bot_scripts.get(key)
     if not info:
         return False
+    _note_stop(key)
     try:
         lf = info.get('log_file')
         if lf and not lf.closed:
@@ -2582,6 +2690,566 @@ async def landing_page(request):
             .replace('__FILES__', str(sum(len(f) for f in user_files.values()))))
     return web.Response(text=page, content_type='text/html')
 
+# ── CUSTOMER TOOLS: .env / requirements / package.json, auto-run, terminal ─────
+SPECIAL_NAMES = {'requirements.txt': 'requirements', 'package.json': 'package'}
+BLOCKED_ENV_KEYS = {'PATH', 'HOME', 'SHELL', 'USER', 'PWD', 'PYTHONPATH', 'PYTHONHOME', 'PYTHONSTARTUP',
+                    'LD_PRELOAD', 'LD_LIBRARY_PATH', 'NODE_OPTIONS', 'NODE_PATH'}
+_ENV_KEY_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+_REQ_LINE_RE = re.compile(
+    r'^[A-Za-z0-9][A-Za-z0-9._\-]*(\[[A-Za-z0-9,_\-]+\])?\s*'
+    r'(((==|>=|<=|~=|!=|<|>)\s*[A-Za-z0-9.*+!_\-]+)\s*,?\s*)*(;[^#]*)?(\s*#.*)?$')
+_PKG_RE = re.compile(r'^(@[A-Za-z0-9._\-]+/)?[A-Za-z0-9][A-Za-z0-9._\-]*(\[[A-Za-z0-9,_\-]+\])?'
+                     r'((==|>=|<=|~=|!=|<|>|@)[A-Za-z0-9.*+!_\-^~<>=]+)?$')
+INSTALL_TIMEOUT = 600
+TERM_TIMEOUT = 90
+TERM_MAX_CHARS = 3500
+TERM_COMMANDS = ('pip', 'python', 'node', 'npm', 'ls', 'cat', 'head', 'tail', 'pwd', 'mkdir', 'rm', 'mv', 'cp')
+_term_busy = set()
+
+def _special_kind(file_name):
+    low = file_name.lower()
+    if low == '.env' or low.endswith('.env'):
+        return 'env'
+    return SPECIAL_NAMES.get(low)
+
+def _user_dotenv(user_id):
+    """Variables from the customer's own .env file, ready to be given to their bot."""
+    path = UPLOAD_BOTS_DIR / str(user_id) / '.env'
+    out = {}
+    try:
+        if not path.is_file() or path.stat().st_size > 200_000:
+            return out
+        for k, v in list(dotenv_values(path).items())[:200]:
+            if v is None or not _ENV_KEY_RE.match(k) or k.upper() in BLOCKED_ENV_KEYS:
+                continue
+            if TOKEN and TOKEN in v:      # never hand the host bot's token to a customer script
+                continue
+            out[k] = v
+    except Exception as e:
+        logger.error(f"Could not read .env of {user_id}: {e}")
+    return out
+
+def _validate_requirements(path):
+    """Only plain package names with optional version pins are allowed (no URLs, paths or pip options)."""
+    bad = []
+    for n, line in enumerate(Path(path).read_text(errors='ignore').splitlines(), 1):
+        t = line.strip()
+        if t and not t.startswith('#') and not _REQ_LINE_RE.match(t):
+            bad.append(f"line {n}: {t[:60]}")
+    return bad
+
+def _run_install(cmd, cwd, timeout=INSTALL_TIMEOUT):
+    try:
+        r = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout, env=_child_env())
+        out = (r.stdout + "\n" + r.stderr).strip()
+        return r.returncode == 0, out[-1200:]
+    except subprocess.TimeoutExpired:
+        return False, f"Timed out after {timeout}s"
+    except Exception as e:
+        return False, str(e)
+
+def _install_requirements(folder):
+    folder = Path(folder)
+    bad = _validate_requirements(folder / 'requirements.txt')
+    if bad:
+        return False, "Not allowed in requirements.txt (use plain package names, e.g. requests==2.32.3):\n" + "\n".join(bad[:8])
+    return _run_install([sys.executable, '-m', 'pip', 'install', '--no-input', '--disable-pip-version-check',
+                         '--upgrade', '--target', str(folder / '.packages'), '-r', str(folder / 'requirements.txt')], folder)
+
+def _install_node(folder):
+    return _run_install(['npm', 'install', '--no-audit', '--no-fund', '--omit=dev'], folder)
+
+def _ensure_dependencies(folder):
+    """After a redeploy the packages are gone: reinstall them from the customer's requirements/package.json."""
+    folder = Path(folder)
+    try:
+        if (folder / 'requirements.txt').is_file() and not (folder / '.packages').is_dir():
+            ok, out = _install_requirements(folder)
+            if not ok:
+                logger.warning(f"requirements install failed in {folder.name}: {out[-200:]}")
+        if (folder / 'package.json').is_file() and not (folder / 'node_modules').is_dir():
+            ok, out = _install_node(folder)
+            if not ok:
+                logger.warning(f"npm install failed in {folder.name}: {out[-200:]}")
+    except Exception as e:
+        logger.error(f"_ensure_dependencies failed: {e}")
+
+async def _stop_for_restart(script_key):
+    info = bot_scripts.pop(script_key, None)
+    if info:
+        lf = info.get('log_file')
+        if lf and not lf.closed:
+            lf.close()
+        await asyncio.to_thread(_terminate_tree, info['process'].pid)
+
+async def _restart_script(user_id, file_name):
+    await _stop_for_restart(f"{user_id}_{file_name}")
+    return await _start_script_headless(user_id, file_name)
+
+async def _restart_user_scripts(user_id):
+    keys = [k for k, i in list(bot_scripts.items()) if i.get('script_owner_id') == user_id]
+    n = 0
+    for k in keys:
+        if await _restart_script(user_id, bot_scripts[k]['file_name']):
+            n += 1
+    return n
+
+async def _auto_run_after_upload(message, user_id, file_name):
+    """Start the file right after it was uploaded (re-uploading a running file replaces it)."""
+    note = await message.answer(f"🚀 Starting <code>{html.escape(file_name)}</code> ...", parse_mode="HTML")
+    ok = await _restart_script(user_id, file_name)
+    key = f"{user_id}_{file_name}"
+    if ok:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛑 Stop Script", callback_data=f"stop_script:{key}")],
+            [InlineKeyboardButton(text="📋 View Output", callback_data=f"view_log:{file_name}")]])
+        await note.edit_text(f"✅ <code>{html.escape(file_name)}</code> is running (PID {bot_scripts[key]['process'].pid}).\n"
+                             f"Your files are saved in the cloud and it restarts itself after a host restart.",
+                             reply_markup=keyboard, parse_mode="HTML")
+        warn = customers.pop_error(user_id)
+        if warn:
+            await message.answer(warn)
+    else:
+        await note.edit_text(f"❌ Could not start <code>{html.escape(file_name)}</code>. Use ▶️ Run in 📁 My Files "
+                             f"and check 📋 View Output.", parse_mode="HTML")
+
+async def _handle_special_upload(message, document, kind):
+    user_id = message.from_user.id
+    if document.file_size and document.file_size > 1_000_000:
+        await message.answer("❌ That file is too big (max 1 MB).")
+        return
+    folder = UPLOAD_BOTS_DIR / str(user_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / {'env': '.env', 'requirements': 'requirements.txt', 'package': 'package.json'}[kind]
+    try:
+        await bot.download(document, destination=target)
+        await _persist_now(user_id)
+        if kind == 'env':
+            n = len(_user_dotenv(user_id))
+            restarted = await _restart_user_scripts(user_id)
+            await message.answer(f"🔐 <b>.env saved</b> ({n} variable(s)). It is given to your bot when it starts."
+                                 + (f"\n♻️ Restarted {restarted} running bot(s) to use it." if restarted else ""),
+                                 parse_mode="HTML")
+            return
+        label = 'requirements.txt' if kind == 'requirements' else 'package.json'
+        status = await message.answer(f"📦 <b>{label} saved.</b> Installing packages, this can take a minute ...",
+                                      parse_mode="HTML")
+        if kind == 'requirements':
+            ok, out = await asyncio.to_thread(_install_requirements, folder)
+        else:
+            ok, out = await asyncio.to_thread(_install_node, folder)
+        restarted = 0
+        if ok:
+            await _persist_now(user_id)
+            restarted = await _restart_user_scripts(user_id)
+        text = (f"✅ <b>Packages installed.</b>" + (f"\n♻️ Restarted {restarted} running bot(s)." if restarted else "")
+                if ok else f"❌ <b>Install failed</b>\n<pre>{html.escape(out[-900:])}</pre>")
+        await status.edit_text(text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"special upload failed: {e}", exc_info=True)
+        await message.answer(f"❌ Failed: {html.escape(str(e))}", parse_mode="HTML")
+
+TERMINAL_HELP = (
+    "🖥️ <b>TERMINAL</b>\n\nRun commands inside your own folder with <code>/term COMMAND</code>\n\n"
+    "<b>Examples</b>\n"
+    "<code>/term pip install requests</code>\n"
+    "<code>/term pip install -r requirements.txt</code>\n"
+    "<code>/term npm install discord.js</code>\n"
+    "<code>/term python bot.py</code>  (runs up to 90 s; use ▶️ / upload to keep a bot running)\n"
+    "<code>/term ls</code> · <code>/term cat .env</code> · <code>/term tail bot.log</code>\n"
+    "<code>/term rm old.py</code> · <code>/term mv a.py b.py</code> · <code>/term mkdir data</code>\n\n"
+    "Allowed commands: " + ", ".join(TERM_COMMANDS) + ".\n"
+    "Pipes, <code>&amp;&amp;</code> and other shell tricks are not supported. Packages you install are private to your bots."
+)
+
+def _term_path(folder, arg):
+    p = (folder / arg).resolve()
+    if p != folder and folder not in p.parents:
+        raise ValueError(f"'{arg}' is outside your folder")
+    return p
+
+def _term_build(user_id, text):
+    """Turn what the customer typed into a safe argv list (no shell). Raises ValueError with a friendly message."""
+    folder = (UPLOAD_BOTS_DIR / str(user_id)).resolve()
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        argv = shlex.split(text)
+    except ValueError:
+        raise ValueError("Could not read that command (check your quotes).")
+    if not argv:
+        raise ValueError("Type a command, e.g. /term ls")
+    cmd, args = argv[0].lower(), argv[1:]
+    if cmd == 'pwd':
+        return folder, ['echo', f"/{user_id}"], False
+    if cmd in ('pip', 'pip3'):
+        sub = args[0] if args else ''
+        if sub not in ('install', 'list', 'show', 'freeze'):
+            raise ValueError("pip: only install, list, show and freeze are allowed.")
+        out = [sys.executable, '-m', 'pip', sub, '--disable-pip-version-check']
+        rest, i = args[1:], 0
+        while i < len(rest):
+            a = rest[i]
+            if sub == 'install' and a in ('-U', '--upgrade', '-q', '--quiet', '--no-cache-dir', '--pre'):
+                out.append(a)
+            elif sub == 'install' and a in ('-r', '--requirement') and i + 1 < len(rest):
+                req = _term_path(folder, rest[i + 1])
+                if not req.is_file():
+                    raise ValueError(f"{rest[i + 1]} not found")
+                bad = _validate_requirements(req)
+                if bad:
+                    raise ValueError("Not allowed in requirements: " + "; ".join(bad[:3]))
+                out += ['-r', str(req)]
+                i += 1
+            elif a.startswith('-'):
+                raise ValueError(f"pip option {a} is not allowed")
+            elif sub in ('install', 'show') and not _PKG_RE.match(a):
+                raise ValueError(f"'{a}' is not a plain package name")
+            else:
+                out.append(a)
+            i += 1
+        if sub in ('install', 'list', 'freeze', 'show'):
+            if sub == 'install':
+                out += ['--no-input', '--upgrade', '--target', str(folder / '.packages')]
+            elif sub in ('list', 'freeze') and (folder / '.packages').is_dir():
+                out += ['--path', str(folder / '.packages')]
+        return folder, out, sub == 'install'
+    if cmd in ('python', 'python3', 'node'):
+        if not args or not args[0].lower().endswith(('.py', '.js')) or (cmd.startswith('python') != args[0].lower().endswith('.py')):
+            raise ValueError(f"Usage: /term {cmd} yourfile.{'js' if cmd == 'node' else 'py'}")
+        script = _term_path(folder, args[0])
+        if not script.is_file():
+            raise ValueError(f"{args[0]} not found")
+        base = ['node'] if cmd == 'node' else [sys.executable, '-u']
+        return folder, base + [str(script)] + args[1:], False
+    if cmd == 'npm':
+        sub = args[0] if args else ''
+        if sub not in ('install', 'i', 'ci', 'ls', 'list'):
+            raise ValueError("npm: only install, ci and ls are allowed.")
+        for a in args[1:]:
+            if a not in ('--save', '--save-dev', '-D', '-S') and not _PKG_RE.match(a):
+                raise ValueError(f"'{a}' is not a plain package name")
+        return folder, ['npm', *args, '--no-audit', '--no-fund'], sub in ('install', 'i', 'ci')
+    if cmd in ('ls', 'cat', 'head', 'tail', 'mkdir', 'rm', 'mv', 'cp'):
+        out, paths = [cmd], []
+        for a in args:
+            if a.startswith('-'):
+                if not re.fullmatch(r'-[A-Za-z0-9]{1,4}', a) or (cmd == 'ls' and 'R' in a):
+                    raise ValueError(f"option {a} is not allowed")
+                out.append(a)
+            else:
+                p = _term_path(folder, a)
+                if cmd in ('rm', 'mv') and p == folder:
+                    raise ValueError("You cannot do that to your whole folder")
+                paths.append(str(p))
+        if cmd in ('cat', 'head', 'tail', 'mkdir', 'rm', 'mv', 'cp') and not paths:
+            raise ValueError(f"Usage: /term {cmd} FILE")
+        if cmd in ('mv', 'cp') and len(paths) != 2:
+            raise ValueError(f"Usage: /term {cmd} FROM TO")
+        return folder, out + (paths or ([str(folder)] if cmd == 'ls' else [])), cmd in ('rm', 'mv', 'cp', 'mkdir')
+    raise ValueError("Command not allowed. Allowed: " + ", ".join(TERM_COMMANDS))
+
+async def _run_terminal(user_id, text):
+    folder, argv, changes_files = _term_build(user_id, text)
+    env = await asyncio.to_thread(_child_env, user_id)
+    proc = await asyncio.create_subprocess_exec(*argv, cwd=str(folder), env=env,
+                                                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    try:
+        data, _ = await asyncio.wait_for(proc.communicate(), timeout=TERM_TIMEOUT)
+        out = data.decode(errors='replace')
+        status = "" if proc.returncode == 0 else f"\n[exit code {proc.returncode}]"
+    except asyncio.TimeoutError:
+        await asyncio.to_thread(_terminate_tree, proc.pid)
+        out, status = "", f"\n⏱️ Stopped after {TERM_TIMEOUT}s. To keep a bot running, upload it (it starts automatically)."
+    if changes_files:
+        await _persist_now(user_id)
+    out = out.strip()
+    if len(out) > TERM_MAX_CHARS:
+        out = "...\n" + out[-TERM_MAX_CHARS:]
+    return (out or "(no output)") + status
+
+@dp.callback_query(F.data == "terminal_help")
+async def callback_terminal_help(callback: types.CallbackQuery):
+    await callback.message.answer(TERMINAL_HELP, parse_mode="HTML")
+    await callback.answer()
+
+@dp.message(Command("term"))
+async def cmd_term(message: types.Message, command: CommandObject):
+    user_id = message.from_user.id
+    if user_id in banned_users:
+        return
+    if bot_locked and user_id not in admin_ids:
+        await message.answer("🔒 Bot is currently locked!")
+        return
+    if not command.args:
+        await message.answer(TERMINAL_HELP, parse_mode="HTML")
+        return
+    if user_id in _term_busy:
+        await message.answer("⏳ Your previous command is still running.")
+        return
+    _term_busy.add(user_id)
+    try:
+        status = await message.answer("⏳ Running ...")
+        try:
+            out = await _run_terminal(user_id, command.args)
+        except ValueError as e:
+            out = f"❌ {e}"
+        except Exception as e:
+            logger.error(f"terminal error: {e}", exc_info=True)
+            out = f"❌ Error: {e}"
+        await status.edit_text(f"<pre>{html.escape(out)}</pre>", parse_mode="HTML")
+    finally:
+        _term_busy.discard(user_id)
+
+# ── CLOUD STORAGE: backups, database info, auto-restore, crash reports ─────────
+async def _send_backup(uid, caption):
+    """Send the customer a ZIP with their bot files + a JSON export of their database."""
+    paths = []
+    try:
+        paths = await asyncio.to_thread(persist.build_backup, uid)
+        for path, name in paths:
+            await bot.send_document(uid, FSInputFile(path, filename=name), caption=caption)
+        return True
+    except Exception as e:
+        logger.error(f"Backup for {uid} failed: {e}", exc_info=True)
+        return False
+    finally:
+        for path, _name in paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+BACKUP_CAPTION = (
+    "💾 Backup of your bot\n\n"
+    "• bot_files/ = your bot files and data files\n"
+    "• database_export.json / mysql_backup.sql / postgres_export.json = your database (if you used one)\n\n"
+    "You can upload these to any host and keep running."
+)
+
+_DB_EXAMPLES = {
+    'mongo': ("Variables: <code>MONGO_URI</code>, <code>MONGO_DB_NAME</code>",
+              "import os\nfrom pymongo import MongoClient\n"
+              "db = MongoClient(os.getenv('MONGO_URI'))[os.getenv('MONGO_DB_NAME')]\n"
+              "db.wallets.update_one({'user': 1}, {'$inc': {'balance': 100}}, upsert=True)"),
+    'mysql': ("Variables: <code>MYSQL_HOST</code>, <code>MYSQL_PORT</code>, <code>MYSQL_USER</code>, "
+              "<code>MYSQL_PASSWORD</code>, <code>MYSQL_DATABASE</code> (or <code>MYSQL_URL</code>)",
+              "import os, pymysql\n"
+              "db = pymysql.connect(host=os.getenv('MYSQL_HOST'), port=int(os.getenv('MYSQL_PORT')),\n"
+              "    user=os.getenv('MYSQL_USER'), password=os.getenv('MYSQL_PASSWORD'),\n"
+              "    database=os.getenv('MYSQL_DATABASE'), autocommit=True)"),
+    'postgres': ("Variables: <code>POSTGRES_URL</code> (same as <code>DATABASE_URL</code>), or <code>PGHOST</code>, "
+                 "<code>PGPORT</code>, <code>PGUSER</code>, <code>PGPASSWORD</code>, <code>PGDATABASE</code>",
+                 "import os, psycopg2\n"
+                 "db = psycopg2.connect(os.getenv('POSTGRES_URL'))\n"
+                 "db.autocommit = True"),
+}
+
+def _db_info_text(user_id):
+    if not customers.enabled:
+        return ("🗄️ <b>My Database</b>\n\nA private database is not enabled on this host yet. "
+                "Your files are still saved and restored automatically after restarts.")
+    info = customers.info(user_id)
+    if not info:
+        return ("🗄️ <b>My Database</b>\n\nYour database is being prepared. Upload and start your bot, "
+                "then open this page again.")
+    eng = info['engine']
+    vars_line, example = _DB_EXAMPLES[eng]
+    return "\n".join([
+        "🗄️ <b>My Database</b>", "",
+        f"Engine: <b>{LABELS[eng]}</b> {EMOJI[eng]}",
+        f"Your private database name: <code>{customers.db_name(user_id)}</code>", "",
+        "It is given to your bot automatically as environment variables every time it starts. "
+        "Use it for wallet balances, transactions, orders, users, anything your bot must remember.",
+        "", vars_line, f"<pre>{example}</pre>",
+        "Also set: <code>DB_ENGINE</code> and <code>DATABASE_URL</code>.", "",
+        "Data survives restarts and redeploys. 💾 My Backup (or /backup) sends you your files and database any time."])
+
+def _usage_text():
+    lines = [f"{label}: {n}/{mx if mx else '∞'} customers" for label, n, mx in customers.usage()]
+    return "\n".join(lines) or "No customer database servers configured."
+
+def _db_keyboard(user_id):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💾 My Backup", callback_data="my_backup"),
+        InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]])
+
+@dp.callback_query(F.data == "my_database")
+async def callback_my_database(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    await callback.message.answer(_db_info_text(uid), reply_markup=_db_keyboard(uid), parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data == "my_backup")
+async def callback_my_backup(callback: types.CallbackQuery):
+    if callback.from_user.id in banned_users:
+        await callback.answer("🚫 Banned", show_alert=True)
+        return
+    await callback.answer("⏳ Preparing your backup...")
+    ok = await _send_backup(callback.from_user.id, BACKUP_CAPTION)
+    if not ok:
+        await callback.message.answer("❌ Could not create the backup right now. Please try again.")
+
+@dp.message(Command("dbstats"))
+async def cmd_dbstats(message: types.Message):
+    if message.from_user.id not in admin_ids:
+        return
+    await message.answer("🗄️ <b>Customer database servers</b>\n\n" + _usage_text(), parse_mode="HTML")
+
+@dp.message(Command("backup"))
+async def cmd_backup(message: types.Message):
+    if message.from_user.id in banned_users:
+        return
+    await message.answer("⏳ Preparing your backup...")
+    if not await _send_backup(message.from_user.id, BACKUP_CAPTION):
+        await message.answer("❌ Could not create the backup right now. Please try again.")
+
+@dp.message(Command("mydb"))
+async def cmd_mydb(message: types.Message):
+    if message.from_user.id in banned_users:
+        return
+    uid = message.from_user.id
+    await message.answer(_db_info_text(uid), reply_markup=_db_keyboard(uid), parse_mode="HTML")
+
+async def _start_script_headless(user_id, file_name):
+    """Start a customer's script without a button press (used to restore bots after a host restart)."""
+    user_folder = UPLOAD_BOTS_DIR / str(user_id)
+    file_path = user_folder / file_name
+    script_key = f"{user_id}_{file_name}"
+    ext = file_path.suffix.lower()
+    if script_key in bot_scripts or script_key in _starting_scripts or ext not in ('.py', '.js') \
+            or not file_path.exists():
+        return False
+    try:
+        if TOKEN and TOKEN in file_path.read_text(errors='ignore'):
+            return False
+    except Exception:
+        pass
+    _stopping.discard(script_key)
+    _starting_scripts.add(script_key)
+    log_file = open(user_folder / f"{file_path.stem}.log", 'a')
+    try:
+        await asyncio.to_thread(_ensure_dependencies, user_folder)
+        if ext == '.py':
+            installed, failed = await asyncio.to_thread(install_missing_dependencies, file_path)
+            if installed:
+                log_file.write(f"[AUTO-INSTALLER] Installed: {', '.join(installed)}\n")
+            if failed:
+                log_file.write(f"[AUTO-INSTALLER] Failed to install: {', '.join(failed)}\n")
+            log_file.flush()
+        await asyncio.to_thread(_kill_orphans, file_path)
+        cmd = [sys.executable, '-u', str(file_path)] if ext == '.py' else ['node', str(file_path)]
+        child_env = await asyncio.to_thread(_child_env, user_id)
+        process = subprocess.Popen(cmd, cwd=str(user_folder), stdout=log_file, stderr=log_file,
+                                   env=child_env)
+        bot_scripts[script_key] = {
+            'process': process, 'file_name': file_name, 'script_owner_id': user_id,
+            'start_time': datetime.now(), 'user_folder': str(user_folder), 'type': ext[1:],
+            'log_file': log_file,
+        }
+        _bg(persist.mark_running, script_key, user_id, file_name)
+        return True
+    except Exception as e:
+        logger.error(f"Auto-start of {script_key} failed: {e}")
+        if not log_file.closed:
+            log_file.close()
+        return False
+    finally:
+        _starting_scripts.discard(script_key)
+
+async def restore_running_scripts():
+    """After a restart/redeploy: start again every bot that was running before."""
+    await asyncio.sleep(5)
+    saved = await asyncio.to_thread(persist.list_running)
+    restored = 0
+    for uid, file_name in saved:
+        key = f"{uid}_{file_name}"
+        if uid in banned_users:
+            continue
+        if not (UPLOAD_BOTS_DIR / str(uid) / file_name).exists():
+            await asyncio.to_thread(persist.clear_running, key)
+            continue
+        if await _start_script_headless(uid, file_name):
+            restored += 1
+            try:
+                await bot.send_message(uid, f"♻️ The host restarted. Your bot <code>{html.escape(file_name)}</code> "
+                                            f"was started again automatically with all your files.", parse_mode="HTML")
+            except Exception:
+                pass
+        await asyncio.sleep(2)
+    if saved:
+        logger.info(f"Auto-restored {restored}/{len(saved)} running bot(s)")
+
+def _tail_log(user_folder, file_name, lines=12):
+    try:
+        text = (Path(user_folder) / f"{Path(file_name).stem}.log").read_text(errors='ignore')
+        return "\n".join(text.strip().splitlines()[-lines:])[-1500:]
+    except Exception:
+        return ""
+
+async def monitor_scripts():
+    """Detect bots that crashed and send the customer their files + database so nothing is lost."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            for key, info in list(bot_scripts.items()):
+                rc = info['process'].poll()
+                if rc is None or key in _stopping:
+                    continue
+                bot_scripts.pop(key, None)
+                lf = info.get('log_file')
+                if lf and not lf.closed:
+                    lf.close()
+                _bg(persist.clear_running, key)
+                uid, file_name = info['script_owner_id'], info['file_name']
+                if rc == 0:
+                    continue          # the script finished normally
+                if time.time() - _last_backup.get(key, 0) < 600:
+                    continue
+                _last_backup[key] = time.time()
+                tail = html.escape(_tail_log(info['user_folder'], file_name))
+                try:
+                    await bot.send_message(
+                        uid,
+                        f"⚠️ <b>Your bot stopped unexpectedly</b>\n\n📄 <code>{html.escape(file_name)}</code>\n"
+                        f"Exit code: <code>{rc}</code>\n\n"
+                        + (f"<b>Last output:</b>\n<pre>{tail}</pre>\n\n" if tail else "")
+                        + "Sending you a backup of your files and database now. You can upload it anywhere and keep going.",
+                        parse_mode="HTML")
+                except Exception:
+                    pass
+                await _send_backup(uid, BACKUP_CAPTION)
+        except Exception as e:
+            logger.error(f"monitor_scripts error: {e}", exc_info=True)
+        await asyncio.sleep(15)
+
+async def persist_loop():
+    """Every 45 seconds copy changed files and the database to MongoDB."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await asyncio.to_thread(persist.flush)
+        except Exception as e:
+            logger.error(f"persist_loop error: {e}")
+        await asyncio.sleep(45)
+
+async def _notify_owner_storage_status():
+    await asyncio.sleep(8)
+    try:
+        if not persist.enabled:
+            text = ("⚠️ <b>Cloud storage is OFF</b>\n\nMONGO_URI is not set, so customer files and the database "
+                    "are lost on every redeploy. Add MONGO_URI in Render → Environment.")
+        elif not persist._restore_ok:
+            text = ("⚠️ <b>Cloud storage could not connect</b>\n\nCheck MONGO_URI and that MongoDB Atlas "
+                    "Network Access allows 0.0.0.0/0. Cloud saving is paused until the next restart.")
+        else:
+            st = persist.stats
+            text = (f"☁️ <b>Cloud storage connected</b>\n\nRestored {st['files']} file(s) for {st['users']} user(s)"
+                    f"{' and the bot database' if st['db_restored'] else ''}.\n"
+                    f"Customer database pool: {customers.counts()['mongo']} MongoDB, {customers.counts()['mysql']} MySQL, {customers.counts()['postgres']} PostgreSQL server(s)")
+        await bot.send_message(OWNER_ID, text, parse_mode="HTML")
+    except Exception:
+        pass
+
 async def keep_alive():
     """Pings itself so the Render free service does not go to sleep"""
     url = os.getenv('RENDER_EXTERNAL_URL')
@@ -2619,9 +3287,28 @@ async def web_server():
 async def main():
     logger.info("🚀 Starting Advanced File Host Bot...")
     
-    asyncio.create_task(web_server())
-    asyncio.create_task(keep_alive())
-    
+    background = [
+        asyncio.create_task(web_server()),
+        asyncio.create_task(keep_alive()),
+        asyncio.create_task(persist_loop()),
+        asyncio.create_task(monitor_scripts()),
+        asyncio.create_task(restore_running_scripts()),
+        asyncio.create_task(_notify_owner_storage_status()),
+    ]
+
+    # Render sends SIGTERM before a redeploy: save everything to MongoDB first
+    async def _graceful_shutdown():
+        logger.info("Shutdown signal received - saving data to cloud storage...")
+        await asyncio.to_thread(persist.flush)
+        await dp.stop_polling()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, lambda: background.append(asyncio.create_task(_graceful_shutdown())))
+        except (NotImplementedError, RuntimeError):
+            pass
+
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

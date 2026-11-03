@@ -17,3 +17,31 @@ services:
         sync: false
       - key: ADMIN_PASSWORD
         sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DB_NAME
+        value: hostbot
+      - key: CUSTOMER_DB_1
+        sync: false
+      - key: CUSTOMER_DB_2
+        sync: false
+      - key: CUSTOMER_DB_3
+        sync: false
+      - key: CUSTOMER_DB_4
+        sync: false
+      - key: CUSTOMER_DB_5
+        sync: false
+      - key: CUSTOMER_DB_6
+        sync: false
+      - key: CUSTOMER_DB_7
+        sync: false
+      - key: CUSTOMER_DB_8
+        sync: false
+      - key: CUSTOMER_DB_9
+        sync: false
+      - key: CUSTOMER_DB_10
+        sync: false
+      - key: DB_SECRET
+        sync: false
+      - key: DB_MAX_PER_SERVER
+        value: "0"
