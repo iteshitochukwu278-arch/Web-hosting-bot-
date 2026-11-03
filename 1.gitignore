@@ -1,0 +1,5 @@
+.env
+inf/
+upload_bots/
+__pycache__/
+*.db
