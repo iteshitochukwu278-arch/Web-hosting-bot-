@@ -46,10 +46,9 @@ except ValueError:
     logger.error("OWNER_ID or ADMIN_ID must be valid integers!")
     raise
 
-YOUR_USERNAME = '@Hackerwibes9'
-UPDATE_CHANNEL = 'https://t.me/geniushackertools'
-YOUTUBE_CHANNEL = 'https://youtube.com/@geniushacker29'
-CHANNEL_USERNAME = '@' + UPDATE_CHANNEL.rstrip('/').split('/')[-1]
+# Optional. Set these in your environment (Render / .env). Leave empty to hide the buttons.
+YOUR_USERNAME = (os.getenv('YOUR_USERNAME') or '').strip()
+UPDATE_CHANNEL = (os.getenv('UPDATE_CHANNEL') or '').strip()
 
 BASE_DIR = Path(__file__).parent.absolute()
 UPLOAD_BOTS_DIR = BASE_DIR / 'upload_bots'
@@ -190,7 +189,7 @@ migrate_db()
 load_data()
 
 # ── AUTO DEPENDENCY INSTALLER ────────────────────────
-# Import name → actual pip package name (jab dono alag hote hain)
+# Import name → actual pip package name (when the two differ)
 IMPORT_TO_PIP = {
     'telebot': 'pyTelegramBotAPI',
     'telegram': 'python-telegram-bot',
@@ -213,7 +212,7 @@ IMPORT_TO_PIP = {
     'serial': 'pyserial',
 }
 
-# Python built-in modules — inhe kabhi install karne ki koshish nahi karni
+# Python built-in modules — never try to install these
 STDLIB_MODULES = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_names') else {
     'os', 'sys', 'time', 'json', 're', 'math', 'random', 'datetime', 'collections',
     'itertools', 'functools', 'subprocess', 'threading', 'asyncio', 'socket', 'io',
@@ -223,7 +222,7 @@ STDLIB_MODULES = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_nam
 }
 
 def extract_imports(file_path):
-    """File ke andar se saare top-level 'import X' / 'from X import Y' nikalta hai"""
+    """Extracts all top-level 'import X' / 'from X import Y' names from the file"""
     modules = set()
     try:
         content = Path(file_path).read_text(errors='ignore')
@@ -235,7 +234,7 @@ def extract_imports(file_path):
     return modules
 
 def install_missing_dependencies(file_path, timeout=90):
-    """Script mein use ho rahi libraries check karke jo missing hain unhe pip se install karta hai.
+    """Checks the libraries used by the script and installs any missing ones with pip.
     Returns: (installed_list, failed_list)"""
     modules = extract_imports(file_path)
     installed, failed = [], []
@@ -263,34 +262,44 @@ def install_missing_dependencies(file_path, timeout=90):
     return installed, failed
 
 def get_user_file_limit(user_id):
-    return OWNER_LIMIT  # Sabke liye unlimited — koi upload limit nahi
+    return OWNER_LIMIT  # Unlimited for everyone — no upload limit
 
 def format_limit(limit):
     return "Unlimited ♾️" if limit == float('inf') else f"{limit} files"
 
+def _contact_url():
+    name = (YOUR_USERNAME or '').strip().lstrip('@')
+    return f"https://t.me/{name}" if name else None
+
+def _updates_url():
+    ch = (UPDATE_CHANNEL or '').strip()
+    if not ch:
+        return None
+    return ch if ch.startswith('http') else 'https://t.me/' + ch.lstrip('@')
+
+def _updates_row():
+    url = _updates_url()
+    return [[InlineKeyboardButton(text="📢 Updates", url=url)]] if url else []
+
+def _contact_row():
+    url = _contact_url()
+    return [[InlineKeyboardButton(text="💬 Contact Support", url=url)]] if url else []
+
 def get_main_keyboard(user_id):
+    rows = [
+        *_updates_row(),
+        [InlineKeyboardButton(text="📤 Upload File", callback_data="upload_file"),
+         InlineKeyboardButton(text="📁 My Files", callback_data="check_files")],
+        [InlineKeyboardButton(text="🔍 Search Files", callback_data="search_files"),
+         InlineKeyboardButton(text="⚡ Bot Speed", callback_data="bot_speed")],
+    ]
     if user_id in admin_ids:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Updates", url=UPDATE_CHANNEL)],
-            [InlineKeyboardButton(text="📤 Upload File", callback_data="upload_file"),
-             InlineKeyboardButton(text="📁 My Files", callback_data="check_files")],
-            [InlineKeyboardButton(text="🔍 Search Files", callback_data="search_files"),
-             InlineKeyboardButton(text="⚡ Bot Speed", callback_data="bot_speed")],
-            [InlineKeyboardButton(text="📊 My Stats", callback_data="statistics"),
-             InlineKeyboardButton(text="👑 Admin Panel", callback_data="admin_panel")],
-            [InlineKeyboardButton(text="💬 Contact", url=f"https://t.me/{YOUR_USERNAME.replace('@', '')}")]
-        ])
+        rows.append([InlineKeyboardButton(text="📊 My Stats", callback_data="statistics"),
+                     InlineKeyboardButton(text="👑 Admin Panel", callback_data="admin_panel")])
     else:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Updates Channel", url=UPDATE_CHANNEL)],
-            [InlineKeyboardButton(text="📤 Upload File", callback_data="upload_file"),
-             InlineKeyboardButton(text="📁 My Files", callback_data="check_files")],
-            [InlineKeyboardButton(text="🔍 Search Files", callback_data="search_files"),
-             InlineKeyboardButton(text="⚡ Bot Speed", callback_data="bot_speed")],
-            [InlineKeyboardButton(text="📊 My Stats", callback_data="statistics")],
-            [InlineKeyboardButton(text="💬 Contact Owner", url=f"https://t.me/{YOUR_USERNAME.replace('@', '')}")]
-        ])
-    return keyboard
+        rows.append([InlineKeyboardButton(text="📊 My Stats", callback_data="statistics")])
+    rows.extend(_contact_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def get_admin_panel_keyboard():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -302,8 +311,9 @@ def get_admin_panel_keyboard():
     return keyboard
 
 def build_welcome_text(user_id: int, full_name: str) -> str:
+    updates_line = f"\n📢 <b>Updates:</b> {_updates_url()}\n" if _updates_url() else "\n"
     return f"""╔═══════════════════════╗
-    🚀 <b>GENIUS HOSTBOT</b> 🚀
+    🚀 <b>HOSTING BOT</b> 🚀
     ⚡ <i>Script Runner Bot</i>
 ╚═══════════════════════╝
 
@@ -325,11 +335,7 @@ def build_welcome_text(user_id: int, full_name: str) -> str:
 💾 <b>File Info</b> — Size, type, date
 ℹ️ <b>Help &amp; Support</b> — Get assistance
 
-━━━━━━━━━━━━━━━━━━━━
-📢 <b>Updates:</b> {UPDATE_CHANNEL}
-🎥 <b>YouTube:</b> {YOUTUBE_CHANNEL}
-
-⚡ <b>Developed by</b> Aditya (Genius Hacker)
+━━━━━━━━━━━━━━━━━━━━{updates_line}
 🔒 <b>Version:</b> 2.0"""
 
 @dp.message(Command("start"))
@@ -691,11 +697,11 @@ async def callback_all_features(callback: types.CallbackQuery):
 13. 🎯 Feature Discovery
 
 ━━━━━━━━━━━━━━━━━━━━
-<b>🆓 SAB KUCH FREE HAI!</b>
+<b>🆓 EVERYTHING IS FREE!</b>
 
 • Unlimited file uploads
-• Koi premium plan nahi
-• Sabke liye same features
+• No premium plans
+• Same features for everyone
 """
     
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -712,14 +718,14 @@ async def callback_get_premium(callback: types.CallbackQuery):
     🆓 <b>100% FREE</b> 🆓
 ╚═══════════════════════╝
 
-Is bot mein <b>koi premium plan nahi</b> hai.
+This bot has <b>no premium plans</b>.
 ✅ Unlimited uploads
-✅ Saare features sabke liye free
+✅ All features are free for everyone
 
-Help chahiye? Owner se contact karo 💬
+Need help? Contact the owner 💬
 """
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Contact Owner", url=f"https://t.me/{YOUR_USERNAME.replace('@', '')}")],
+        *_contact_row(),
         [InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
     ])
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
@@ -994,33 +1000,118 @@ async def handle_document(message: types.Message):
         logger.error(f"Error uploading file: {e}")
         await message.answer(f"❌ Upload failed: {str(e)}")
 
+_starting_scripts = set()  # script keys that are being launched right now
+
+# Environment variables of THIS host bot that must never leak into hosted scripts.
+# If a hosted bot inherited BOT_TOKEN it would poll the host bot's token ("Conflict" errors),
+# and an inherited PORT would clash with the host's own web server.
+_HOST_ONLY_ENV = (
+    'BOT_TOKEN', 'OWNER_ID', 'ADMIN_ID', 'ADMIN_PASSWORD', 'UPDATE_CHANNEL', 'YOUR_USERNAME',
+    'PORT', 'RENDER_EXTERNAL_URL', 'DATABASE_PATH', 'WEB_CONCURRENCY',
+)
+
+def _child_env():
+    env = os.environ.copy()
+    for k in _HOST_ONLY_ENV:
+        env.pop(k, None)
+    env['PYTHONUNBUFFERED'] = '1'
+    return env
+
+def _terminate_tree(pid, grace=3):
+    """Terminate a process and all its children, then kill whatever is still alive."""
+    try:
+        parent = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return
+    procs = parent.children(recursive=True) + [parent]
+    for p in procs:
+        try:
+            p.terminate()
+        except psutil.NoSuchProcess:
+            pass
+    _, alive = psutil.wait_procs(procs, timeout=grace)
+    for p in alive:
+        try:
+            p.kill()
+        except psutil.NoSuchProcess:
+            pass
+
+def _reap_dead_scripts():
+    """Drop entries of scripts that already exited/crashed so 'Start' works again."""
+    for key in list(bot_scripts.keys()):
+        info = bot_scripts[key]
+        try:
+            if info['process'].poll() is not None:
+                lf = info.get('log_file')
+                if lf and not lf.closed:
+                    lf.close()
+                del bot_scripts[key]
+        except Exception:
+            bot_scripts.pop(key, None)
+
+def _kill_orphans(file_path):
+    """Kill leftover processes still running the same file (e.g. after a host restart)."""
+    tracked = {i['process'].pid for i in bot_scripts.values()}
+    target = str(file_path)
+    me = os.getpid()
+    for p in psutil.process_iter(['pid', 'cmdline']):
+        try:
+            cmd = p.info.get('cmdline') or []
+            if p.info['pid'] in tracked or p.info['pid'] == me:
+                continue
+            if target in cmd:
+                _terminate_tree(p.info['pid'])
+        except Exception:
+            continue
+
 @dp.callback_query(F.data.startswith("run_script:"))
 async def callback_run_script(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     file_name = callback.data.split(":", 1)[1]
-    
+
     user_folder = UPLOAD_BOTS_DIR / str(user_id)
     file_path = user_folder / file_name
-    
+
     if not file_path.exists():
         await callback.answer("❌ File not found!", show_alert=True)
         return
-    
+
     script_key = f"{user_id}_{file_name}"
-    
-    if script_key in bot_scripts:
-        await callback.answer("⚠️ Script is already running!", show_alert=True)
+
+    _reap_dead_scripts()
+    if script_key in bot_scripts or script_key in _starting_scripts:
+        await callback.answer("⚠️ Script is already running or starting!", show_alert=True)
         return
-    
+
     file_ext = file_path.suffix.lower()
-    
+    if file_ext not in ('.py', '.js'):
+        await callback.answer("❌ Cannot run this file type!", show_alert=True)
+        return
+
+    # Safety: never run a script that uses the host bot's own token (it would break this bot)
     try:
+        if TOKEN and TOKEN in file_path.read_text(errors='ignore'):
+            await callback.answer(
+                "❌ This file contains the hosting bot's own token. Use a different bot token for your script.",
+                show_alert=True)
+            return
+    except Exception:
+        pass
+
+    # Lock immediately so a second tap cannot start a duplicate copy, and answer the tap right away.
+    _starting_scripts.add(script_key)
+    log_file = None
+    try:
+        await callback.answer("⏳ Starting your script, please wait...")
+
         log_file_path = user_folder / f"{file_path.stem}.log"
         log_file = open(log_file_path, 'w')
-        
+
+        status_msg = None
         if file_ext == '.py':
             status_msg = await callback.message.answer("📦 <i>Checking dependencies...</i>", parse_mode="HTML")
-            installed, failed = install_missing_dependencies(file_path)
+            # pip can take a long time: run it in a thread so the whole bot does not freeze
+            installed, failed = await asyncio.to_thread(install_missing_dependencies, file_path)
             if installed:
                 log_file.write(f"[AUTO-INSTALLER] Installed: {', '.join(installed)}\n")
             if failed:
@@ -1031,24 +1122,18 @@ async def callback_run_script(callback: types.CallbackQuery):
             except Exception:
                 pass
 
-            process = subprocess.Popen(
-                [sys.executable, str(file_path)],
-                cwd=str(user_folder),
-                stdout=log_file,
-                stderr=log_file
-            )
-        elif file_ext == '.js':
-            process = subprocess.Popen(
-                ['node', str(file_path)],
-                cwd=str(user_folder),
-                stdout=log_file,
-                stderr=log_file
-            )
-        else:
-            log_file.close()
-            await callback.answer("❌ Cannot run this file type!", show_alert=True)
-            return
-        
+        # make sure no old copy of this same file is still alive
+        await asyncio.to_thread(_kill_orphans, file_path)
+
+        cmd = [sys.executable, '-u', str(file_path)] if file_ext == '.py' else ['node', str(file_path)]
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(user_folder),
+            stdout=log_file,
+            stderr=log_file,
+            env=_child_env(),
+        )
+
         bot_scripts[script_key] = {
             'process': process,
             'file_name': file_name,
@@ -1058,31 +1143,34 @@ async def callback_run_script(callback: types.CallbackQuery):
             'type': file_ext[1:],
             'log_file': log_file
         }
-        
+
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
         c.execute('UPDATE bot_stats SET stat_value = stat_value + 1 WHERE stat_name = ?', ('total_runs',))
         conn.commit()
         conn.close()
         bot_stats['total_runs'] = bot_stats.get('total_runs', 0) + 1
-        
-        try:
-            await callback.answer(f"✅ Script started! (PID: {process.pid})", show_alert=True)
-        except Exception:
-            await callback.message.answer(f"✅ Script started! (PID: {process.pid})")
-        
+
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🛑 Stop Script", callback_data=f"stop_script:{script_key}")],
             [InlineKeyboardButton(text="📋 View Output", callback_data=f"view_log:{file_name}")],
             [InlineKeyboardButton(text="📁 My Files", callback_data="check_files"),
              InlineKeyboardButton(text="🏠 Home", callback_data="back_to_main")]
         ])
-        
-        await callback.message.edit_reply_markup(reply_markup=keyboard)
-        
+        await callback.message.answer(
+            f"✅ <b>{file_name}</b> started! (PID: {process.pid})",
+            reply_markup=keyboard, parse_mode="HTML")
+
     except Exception as e:
         logger.error(f"Error running script: {e}")
-        await callback.answer(f"❌ Error: {str(e)}", show_alert=True)
+        if log_file and not log_file.closed and script_key not in bot_scripts:
+            log_file.close()
+        try:
+            await callback.message.answer(f"❌ Error starting script: {e}")
+        except Exception:
+            pass
+    finally:
+        _starting_scripts.discard(script_key)
 
 @dp.callback_query(F.data.startswith("view_log:"))
 async def callback_view_log(callback: types.CallbackQuery):
@@ -1093,7 +1181,7 @@ async def callback_view_log(callback: types.CallbackQuery):
     log_path = user_folder / f"{file_stem}.log"
 
     if not log_path.exists():
-        await callback.answer("❌ Koi log nahi mila. Pehle script run karo.", show_alert=True)
+        await callback.answer("❌ No log found. Run the script first.", show_alert=True)
         return
 
     try:
@@ -1102,7 +1190,7 @@ async def callback_view_log(callback: types.CallbackQuery):
         running_note = "🟢 Status: Running" if script_key in bot_scripts else "🔴 Status: Stopped/Exited"
 
         if not content:
-            content = "(Abhi tak koi output nahi — script chup-chaap chal rahi hai)"
+            content = "(No output yet — the script is running silently)"
         elif len(content) > 3500:
             content = "...(truncated)...\n" + content[-3500:]
 
@@ -1140,15 +1228,9 @@ async def callback_stop_script(callback: types.CallbackQuery):
         if log_file and not log_file.closed:
             log_file.close()
         
-        parent = psutil.Process(process.pid)
-        children = parent.children(recursive=True)
-        
-        for child in children:
-            child.terminate()
-        
-        parent.terminate()
-        
-        del bot_scripts[script_key]
+        await asyncio.to_thread(_terminate_tree, process.pid)
+
+        bot_scripts.pop(script_key, None)
         
         await callback.answer("✅ Script stopped successfully!", show_alert=True)
         
@@ -1209,8 +1291,8 @@ Please wait...
             if file_ext in ['.py', '.js']:
                 just_name = file_path.name
                 
-                # Agar file kisi subfolder mein extract hui hai, use root user_folder mein move karo
-                # taaki baad mein run karte waqt file mil jaye (registration sirf naam track karta hai)
+                # If the file was extracted into a subfolder, move it to the root user_folder
+                # so it can be found when running later (registration only tracks the file name)
                 extracted_full_path = user_folder / extracted_file
                 target_path = user_folder / just_name
                 if extracted_full_path.exists() and extracted_full_path != target_path:
@@ -1218,7 +1300,7 @@ Please wait...
                         extracted_full_path.rename(target_path)
                         just_name = target_path.name
                     else:
-                        # Naam already exist karta hai to unique bana do (overwrite se bachne ke liye)
+                        # Name already exists, make it unique (to avoid overwriting)
                         stem, suf = target_path.stem, target_path.suffix
                         counter = 1
                         new_target = user_folder / f"{stem}_{counter}{suf}"
@@ -2205,7 +2287,7 @@ _BOT_USERNAME = None
 
 def _auth_ok(request):
     if not ADMIN_PASSWORD:
-        return True  # password set nahi hai to panel open rahega
+        return True  # no password set, so the panel stays open
     h = request.headers.get('Authorization', '')
     if not h.startswith('Basic '):
         return False
@@ -2217,7 +2299,7 @@ def _auth_ok(request):
 
 def _deny():
     if not ADMIN_PASSWORD:
-        return web.Response(text="Panel off hai. Render Environment mein ADMIN_PASSWORD set karo.", status=503)
+        return web.Response(text="Panel is disabled. Set ADMIN_PASSWORD in your Render environment.", status=503)
     return web.Response(status=401, headers={'WWW-Authenticate': 'Basic realm="Admin"'}, text="Login required")
 
 def _running_list():
@@ -2329,10 +2411,10 @@ async def panel_action(request):
         return web.json_response({'ok': False, 'msg': 'Invalid data'}, status=400)
 
     if act in ('ban', 'unban', 'stop_user') and uid is None:
-        return web.json_response({'ok': False, 'msg': 'User ID chahiye'})
+        return web.json_response({'ok': False, 'msg': 'User ID required'})
     if act == 'ban':
         if uid in admin_ids:
-            return web.json_response({'ok': False, 'msg': 'Admin ko ban nahi kar sakte'})
+            return web.json_response({'ok': False, 'msg': 'You cannot ban an admin'})
         banned_users.add(uid)
         _db('INSERT OR REPLACE INTO banned_users (user_id, banned_date, reason) VALUES (?, ?, ?)',
             (uid, datetime.now().isoformat(), 'Banned from web panel'))
@@ -2346,21 +2428,21 @@ async def panel_action(request):
         return web.json_response({'ok': True, 'msg': f'{uid} unbanned'})
     if act == 'stop_user':
         n = sum(1 for r in _running_list() if r['owner'] == uid and _stop_script(r['key']))
-        return web.json_response({'ok': True, 'msg': f'{n} bot(s) stop kiye'})
+        return web.json_response({'ok': True, 'msg': f'{n} bot(s) stopped'})
     if act == 'stop_script':
-        return web.json_response({'ok': _stop_script(d.get('key')), 'msg': 'Script stop kiya'})
+        return web.json_response({'ok': _stop_script(d.get('key')), 'msg': 'Script stopped'})
     if act == 'stop_all':
         n = sum(1 for r in _running_list() if _stop_script(r['key']))
-        return web.json_response({'ok': True, 'msg': f'{n} bot(s) stop kiye'})
+        return web.json_response({'ok': True, 'msg': f'{n} bot(s) stopped'})
     if act == 'lock':
         bot_locked = not bot_locked
         return web.json_response({'ok': True, 'msg': 'Bot LOCKED' if bot_locked else 'Bot UNLOCKED'})
     if act == 'broadcast':
         text = (d.get('text') or '').strip()
         if not text or len(text) > 3500:
-            return web.json_response({'ok': False, 'msg': 'Message khali ya bahut lamba hai'})
+            return web.json_response({'ok': False, 'msg': 'Message is empty or too long'})
         asyncio.create_task(_broadcast(text))
-        return web.json_response({'ok': True, 'msg': f'Broadcast shuru: {len(active_users)} users ko'})
+        return web.json_response({'ok': True, 'msg': f'Broadcast started: {len(active_users)} users'})
     return web.json_response({'ok': False, 'msg': 'Unknown action'})
 
 async def panel_api(request):
@@ -2369,7 +2451,7 @@ async def panel_api(request):
     return web.json_response(_collect())
 
 ADMIN_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Genius HostBot - Dashboard</title><style>
+<title>Hosting Bot - Dashboard</title><style>
 *{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:#0b0f17;color:#e6edf3;display:flex;min-height:100vh}
 #side{width:220px;background:#111826;border-right:1px solid #1f2a3d;padding:16px 10px;position:fixed;top:0;bottom:0;left:0;z-index:20;transition:.2s}
 .logo{font-weight:800;font-size:17px;padding:4px 10px 16px}.logo span{color:#58a6ff}
@@ -2395,12 +2477,12 @@ input,textarea{background:#0b0f17;color:#e6edf3;border:1px solid #30363d;border-
 #toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);padding:10px 18px;border-radius:8px;display:none;font-size:13px;z-index:99}
 @media(max-width:760px){#side{left:-230px}#side.open{left:0}#main{margin-left:0}#top{display:flex}}
 </style></head><body>
-<div id="side"><div class="logo">🚀 Genius <span>HostBot</span></div>
+<div id="side"><div class="logo">🚀 Hosting <span>Bot</span></div>
 <button class="nav on" data-p="over">📊 Overview</button><button class="nav" data-p="bots">🤖 Running Bots</button>
 <button class="nav" data-p="files">📁 All Files</button><button class="nav" data-p="users">👥 Users</button>
 <button class="nav" data-p="cast">📢 Broadcast</button><button class="nav" data-p="set">⚙️ Settings</button>
-<a class="nav" href="/" style="text-decoration:none">🌐 Website</a><div class="side-foot">Developed by Aditya</div></div>
-<div id="main"><div id="top"><button class="a b" onclick="$('side').classList.toggle('open')">☰ Menu</button><b>Genius HostBot</b></div>
+<a class="nav" href="/" style="text-decoration:none">🌐 Website</a><div class="side-foot">Hosting Bot</div></div>
+<div id="main"><div id="top"><button class="a b" onclick="$('side').classList.toggle('open')">☰ Menu</button><b>Hosting Bot</b></div>
 <h2 id="ttl"></h2><div class="sub" id="st"></div><div id="view"></div></div><div id="toast"></div>
 <script>
 const $=id=>document.getElementById(id);let D=null,P='over',Q='';
@@ -2409,23 +2491,23 @@ function toast(m,ok=true){const t=$('toast');t.textContent=m;t.style.background=
 async function act(b){try{const r=await fetch('/admin/action',{method:'POST',headers:{'Content-Type':'application/json','X-Panel':'1'},body:JSON.stringify(b)});const j=await r.json();toast(j.msg||'Done',j.ok);load()}catch(e){toast('Error',false)}}
 document.querySelectorAll('button.nav').forEach(b=>b.onclick=()=>{P=b.dataset.p;document.querySelectorAll('button.nav').forEach(x=>x.classList.toggle('on',x==b));$('side').classList.remove('open');render()});
 const card=(l,n)=>`<div class="card"><div class="n">${esc(n)}</div><div class="l">${l}</div></div>`;
-function bots(){return `<div class="box wrap"><table><tr><th>User</th><th>File</th><th>Type</th><th>Start</th><th></th></tr>`+(D.running.map(r=>`<tr><td>${r.owner}</td><td>${esc(r.file)}</td><td>${esc(r.type)}</td><td>${esc(r.since)}</td><td><button class="a r" onclick='act({action:"stop_script",key:${JSON.stringify(r.key)}})'>Stop</button></td></tr>`).join('')||'<tr><td colspan=5>Koi bot nahi chal raha</td></tr>')+`</table></div>`}
+function bots(){return `<div class="box wrap"><table><tr><th>User</th><th>File</th><th>Type</th><th>Start</th><th></th></tr>`+(D.running.map(r=>`<tr><td>${r.owner}</td><td>${esc(r.file)}</td><td>${esc(r.type)}</td><td>${esc(r.since)}</td><td><button class="a r" onclick='act({action:"stop_script",key:${JSON.stringify(r.key)}})'>Stop</button></td></tr>`).join('')||'<tr><td colspan=5>No bots running</td></tr>')+`</table></div>`}
 function render(){if(!D)return;const T={over:'Overview',bots:'Running Bots',files:'All Files',users:'Users',cast:'Broadcast',set:'Settings'};$('ttl').textContent=T[P];
 $('st').textContent=(D.locked?'🔒 Maintenance mode':'✅ Bot active')+' • uptime '+D.uptime+' • auto-refresh 15s';let h='';
 if(P=='over'){const mx=Math.max(1,...D.joins7.map(x=>x[1])),tt=Math.max(1,...Object.values(D.types));
 h=`<div class="grid">${card('👥 Total Members',D.total_users)}${card('🆕 New today',D.new_today)}${card('🔥 Active 24h',D.active24)}${card('🟢 Bots running',D.running_now)}${card('📁 Files',D.total_files)}${card('🚫 Banned',D.banned)}${card('👑 Admins',D.admins)}${card('📤 Uploads',D.uploads)}${card('📥 Downloads',D.downloads)}${card('▶️ Script runs',D.runs)}${card('🧠 RAM MB',D.ram_mb)}${card('⚙️ CPU %',D.cpu)}</div>
 <div class="two"><div class="box"><b>📈 Naye members (7 din)</b><div class="bars">${D.joins7.map(x=>`<div class="bc"><i>${x[1]}</i><div class="bar" style="height:${8+x[1]/mx*80}px"></div><small>${x[0]}</small></div>`).join('')}</div></div>
-<div class="box"><b>🗂 File types</b>${Object.entries(D.types).map(([k,v])=>`<div class="hb"><span>${esc(k)}</span><div><div style="width:${v/tt*100}%"></div></div><em>${v}</em></div>`).join('')||'<p class="sub">Abhi koi file nahi</p>'}
+<div class="box"><b>🗂 File types</b>${Object.entries(D.types).map(([k,v])=>`<div class="hb"><span>${esc(k)}</span><div><div style="width:${v/tt*100}%"></div></div><em>${v}</em></div>`).join('')||'<p class="sub">No files yet</p>'}
 <b style="display:block;margin-top:14px">🏆 Top users (files)</b>${D.top.map(t=>`<div class="hb"><span>${t[0]}</span><div><div style="width:${t[1]/Math.max(1,D.top[0][1])*100}%"></div></div><em>${t[1]}</em></div>`).join('')||'<p class="sub">-</p>'}</div></div>
-<h3>🤖 Abhi chal rahe bots</h3>`+bots()}
+<h3>🤖 Currently running bots</h3>`+bots()}
 if(P=='bots')h=bots();
-if(P=='files')h=`<input placeholder="🔍 File ya user ID search..." value="${esc(Q)}" oninput="Q=this.value;render()" style="margin-bottom:10px"><div class="box wrap"><table><tr><th>User</th><th>File</th><th>Type</th><th>Status</th></tr>`+(D.files_list.filter(f=>(f.name+f.owner).toLowerCase().includes(Q.toLowerCase())).map(f=>`<tr><td>${f.owner}</td><td>${esc(f.name)}</td><td>${esc(f.type)}</td><td><span class="tag ${f.on?'t-on':'t-off'}">${f.on?'Running':'Stopped'}</span></td></tr>`).join('')||'<tr><td colspan=4>Koi file nahi</td></tr>')+`</table></div>`;
-if(P=='users')h=`<input placeholder="🔍 User ID search..." value="${esc(Q)}" oninput="Q=this.value;render()" style="margin-bottom:10px"><div class="box wrap"><table><tr><th>User ID</th><th>Joined</th><th>Last active</th><th>Files</th><th>Run</th><th>Tags</th><th></th></tr>`+(D.users.filter(u=>String(u.id).includes(Q)).map(u=>`<tr><td>${u.id}</td><td>${esc(u.joined)}</td><td>${esc(u.last)}</td><td>${u.files}</td><td>${u.running}</td><td>${u.banned?'🚫':''}${u.admin?'👑':''}</td><td>${u.banned?`<button class="a g" onclick="act({action:'unban',user_id:${u.id}})">Unban</button>`:`<button class="a r" onclick="act({action:'ban',user_id:${u.id}})">Ban</button>`} <button class="a" onclick="act({action:'stop_user',user_id:${u.id}})">Stop bots</button></td></tr>`).join('')||'<tr><td colspan=7>Koi user nahi</td></tr>')+`</table></div>`;
-if(P=='cast')h=`<div class="box"><b>📢 Saare users ko message</b><textarea id="bc" rows="5" placeholder="Message likho..." style="margin:10px 0"></textarea><button class="a b" onclick="cast()">Send to all users</button></div>`;
-if(P=='set')h=`<div class="box"><b>Bot control</b><div class="row" style="margin-top:10px"><button class="a b" onclick="act({action:'lock'})">🔒 Lock / Unlock bot</button><button class="a r" onclick="if(confirm('Saare bots stop karein?'))act({action:'stop_all'})">🛑 Stop ALL bots</button></div></div><div class="box"><b>Manual ban / unban</b><div class="row" style="margin-top:10px"><input id="uid" placeholder="User ID" inputmode="numeric"><button class="a r" onclick="m('ban')">Ban</button><button class="a g" onclick="m('unban')">Unban</button></div></div>`;
+if(P=='files')h=`<input placeholder="🔍 Search file or user ID..." value="${esc(Q)}" oninput="Q=this.value;render()" style="margin-bottom:10px"><div class="box wrap"><table><tr><th>User</th><th>File</th><th>Type</th><th>Status</th></tr>`+(D.files_list.filter(f=>(f.name+f.owner).toLowerCase().includes(Q.toLowerCase())).map(f=>`<tr><td>${f.owner}</td><td>${esc(f.name)}</td><td>${esc(f.type)}</td><td><span class="tag ${f.on?'t-on':'t-off'}">${f.on?'Running':'Stopped'}</span></td></tr>`).join('')||'<tr><td colspan=4>No files</td></tr>')+`</table></div>`;
+if(P=='users')h=`<input placeholder="🔍 Search user ID..." value="${esc(Q)}" oninput="Q=this.value;render()" style="margin-bottom:10px"><div class="box wrap"><table><tr><th>User ID</th><th>Joined</th><th>Last active</th><th>Files</th><th>Run</th><th>Tags</th><th></th></tr>`+(D.users.filter(u=>String(u.id).includes(Q)).map(u=>`<tr><td>${u.id}</td><td>${esc(u.joined)}</td><td>${esc(u.last)}</td><td>${u.files}</td><td>${u.running}</td><td>${u.banned?'🚫':''}${u.admin?'👑':''}</td><td>${u.banned?`<button class="a g" onclick="act({action:'unban',user_id:${u.id}})">Unban</button>`:`<button class="a r" onclick="act({action:'ban',user_id:${u.id}})">Ban</button>`} <button class="a" onclick="act({action:'stop_user',user_id:${u.id}})">Stop bots</button></td></tr>`).join('')||'<tr><td colspan=7>No users</td></tr>')+`</table></div>`;
+if(P=='cast')h=`<div class="box"><b>📢 Message all users</b><textarea id="bc" rows="5" placeholder="Write your message..." style="margin:10px 0"></textarea><button class="a b" onclick="cast()">Send to all users</button></div>`;
+if(P=='set')h=`<div class="box"><b>Bot control</b><div class="row" style="margin-top:10px"><button class="a b" onclick="act({action:'lock'})">🔒 Lock / Unlock bot</button><button class="a r" onclick="if(confirm('Stop all bots?'))act({action:'stop_all'})">🛑 Stop ALL bots</button></div></div><div class="box"><b>Manual ban / unban</b><div class="row" style="margin-top:10px"><input id="uid" placeholder="User ID" inputmode="numeric"><button class="a r" onclick="m('ban')">Ban</button><button class="a g" onclick="m('unban')">Unban</button></div></div>`;
 $('view').innerHTML=h;const i=document.querySelector('#view input[oninput]');if(i&&Q){i.focus();i.setSelectionRange(Q.length,Q.length)}}
 function m(a){const u=$('uid').value.trim();if(!u)return toast('User ID daalo',false);act({action:a,user_id:u})}
-function cast(){const t=$('bc').value.trim();if(!t)return toast('Message likho',false);if(confirm('Sabko bhejein?')){act({action:'broadcast',text:t});$('bc').value=''}}
+function cast(){const t=$('bc').value.trim();if(!t)return toast('Write a message',false);if(confirm('Send to everyone?')){act({action:'broadcast',text:t});$('bc').value=''}}
 async function load(){try{D=await (await fetch('/admin/api')).json();const a=document.activeElement;if(a&&(a.tagName=='TEXTAREA'||a.id=='uid'))return;render()}catch(e){$('st').textContent='Load error'}}
 load();setInterval(load,15000);
 </script></body></html>"""
@@ -2436,7 +2518,7 @@ async def admin_page(request):
     return web.Response(text=ADMIN_HTML, content_type='text/html')
 
 LANDING_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Genius HostBot - Free Telegram Bot Hosting</title><meta name="description" content="Python aur Node.js bots ko Telegram se free mein host karo. Unlimited uploads, koi premium nahi.">
+<title>Hosting Bot - Free Telegram Bot Hosting</title><meta name="description" content="Host your Python and Node.js bots straight from Telegram. Unlimited uploads, no premium plans.">
 <style>
 *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;font-family:system-ui,sans-serif;background:#070b12;color:#e6edf3;line-height:1.55}
 nav{display:flex;justify-content:space-between;align-items:center;padding:14px 22px;position:sticky;top:0;background:#070b12ee;backdrop-filter:blur(8px);border-bottom:1px solid #151d2c;z-index:5}
@@ -2453,29 +2535,29 @@ details{background:#0f1624;border:1px solid #1f2a3d;border-radius:12px;padding:1
 .cta{text-align:center;background:linear-gradient(135deg,#12315f,#0f1624);border-radius:18px;padding:34px 20px}
 footer{text-align:center;color:#6b7785;padding:28px 10px;font-size:13px;border-top:1px solid #151d2c}footer a{color:#58a6ff;text-decoration:none;margin:0 6px}
 </style></head><body>
-<nav><b>🚀 Genius <span>HostBot</span></b><div><a href="#features">Features</a><a href="#how">How it works</a><a href="#faq">FAQ</a></div></nav>
+<nav><b>🚀 Hosting <span>Bot</span></b><div><a href="#features">Features</a><a href="#how">How it works</a><a href="#faq">FAQ</a></div></nav>
 <div class="hero"><div class="badge">🆓 100% Free &bull; Unlimited Uploads</div>
-<h1>Apne Bots ko <span>24/7</span> Host Karo<br>Seedha Telegram Se</h1>
-<p>Python (.py), Node.js (.js) ya ZIP file bhejo, dependencies khud install hongi aur bot chalu. Koi premium plan nahi, koi limit nahi.</p>
-<a class="btn p" href="__BOTLINK__">🚀 Start on Telegram</a><a class="btn s" href="__CHANNEL__">📢 Updates Channel</a></div>
+<h1>Host Your Bots <span>24/7</span><br>Straight From Telegram</h1>
+<p>Send a Python (.py), Node.js (.js) or ZIP file. Dependencies install automatically and your bot starts. No premium plans, no limits.</p>
+<a class="btn p" href="__BOTLINK__">🚀 Start on Telegram</a>__UPDATES_BTN__</div>
 <div class="stats"><div class="st"><b>__USERS__</b><small>Users</small></div><div class="st"><b>__RUNNING__</b><small>Bots running now</small></div><div class="st"><b>__FILES__</b><small>Files hosted</small></div></div>
 <section id="features"><h2>Features</h2><div class="g">
-<div class="f"><h3>📤 Easy Upload</h3><p>.py, .js aur .zip files seedha Telegram chat se upload karo.</p></div>
-<div class="f"><h3>⚙️ Auto Install</h3><p>Zaroori Python packages apne aap install ho jate hain.</p></div>
-<div class="f"><h3>▶️ Run &amp; Stop</h3><p>Bot ke buttons se script start, stop aur manage karo.</p></div>
-<div class="f"><h3>📁 File Manager</h3><p>Files dekho, search karo, download aur delete karo.</p></div>
-<div class="f"><h3>⭐ Favorites</h3><p>Apni important scripts ko favorite mein rakho.</p></div>
-<div class="f"><h3>🆓 Totally Free</h3><p>Unlimited uploads, sabke liye same features.</p></div></div></section>
-<section id="how"><h2>Kaise use karein</h2>
-<div class="step"><div class="num">1</div><div><b>Bot kholo</b><br><span style="color:#9aa7b5">Telegram pe bot open karke /start dabao.</span></div></div>
-<div class="step"><div class="num">2</div><div><b>File upload karo</b><br><span style="color:#9aa7b5">Apni .py, .js ya .zip file bhejo.</span></div></div>
-<div class="step"><div class="num">3</div><div><b>Run dabao</b><br><span style="color:#9aa7b5">Bot chalu, aur stop bhi kabhi bhi kar sakte ho.</span></div></div></section>
+<div class="f"><h3>📤 Easy Upload</h3><p>Upload .py, .js and .zip files directly from the Telegram chat.</p></div>
+<div class="f"><h3>⚙️ Auto Install</h3><p>Required Python packages are installed automatically.</p></div>
+<div class="f"><h3>▶️ Run &amp; Stop</h3><p>Start, stop and manage your scripts with bot buttons.</p></div>
+<div class="f"><h3>📁 File Manager</h3><p>View, search, download and delete your files.</p></div>
+<div class="f"><h3>⭐ Favorites</h3><p>Keep your important scripts in your favorites.</p></div>
+<div class="f"><h3>🆓 Totally Free</h3><p>Unlimited uploads, same features for everyone.</p></div></div></section>
+<section id="how"><h2>How it works</h2>
+<div class="step"><div class="num">1</div><div><b>Open the bot</b><br><span style="color:#9aa7b5">Open the bot on Telegram and press /start.</span></div></div>
+<div class="step"><div class="num">2</div><div><b>Upload your file</b><br><span style="color:#9aa7b5">Send your .py, .js or .zip file.</span></div></div>
+<div class="step"><div class="num">3</div><div><b>Press Run</b><br><span style="color:#9aa7b5">Your bot starts, and you can stop it at any time.</span></div></div></section>
 <section id="faq"><h2>FAQ</h2>
-<details><summary>Kya ye sach mein free hai?</summary><p>Haan, koi premium plan ya upload limit nahi hai.</p></details>
-<details><summary>Kaunsi files chalti hain?</summary><p>Python (.py), Node.js (.js) aur ZIP projects.</p></details>
-<details><summary>Problem aaye to?</summary><p>Telegram pe owner @Hackerwibes2 se contact karo.</p></details></section>
-<section><div class="cta"><h2 style="margin-bottom:8px">Ready to host? 🚀</h2><p style="color:#9aa7b5;margin:0 0 16px">Abhi Telegram pe bot kholo.</p><a class="btn p" href="__BOTLINK__">Open Bot</a></div></section>
-<footer>Developed by <b>Aditya (Genius Hacker)</b><br><a href="__YT__">YouTube</a>&bull;<a href="__CHANNEL__">Telegram Channel</a>&bull;<a href="https://t.me/__OWNER__">Contact</a></footer></body></html>"""
+<details><summary>Is it really free?</summary><p>Yes. There are no premium plans and no upload limits.</p></details>
+<details><summary>Which files can I run?</summary><p>Python (.py), Node.js (.js) and ZIP projects.</p></details>
+<details><summary>What if I have a problem?</summary><p>Contact the owner on Telegram using the support link below.</p></details></section>
+<section><div class="cta"><h2 style="margin-bottom:8px">Ready to host? 🚀</h2><p style="color:#9aa7b5;margin:0 0 16px">Open the bot on Telegram now.</p><a class="btn p" href="__BOTLINK__">Open Bot</a></div></section>
+<footer>__FOOTER_LINKS__</footer></body></html>"""
 
 async def landing_page(request):
     global _BOT_USERNAME
@@ -2484,16 +2566,24 @@ async def landing_page(request):
             _BOT_USERNAME = (await bot.get_me()).username
         except Exception:
             _BOT_USERNAME = ''
-    ch = UPDATE_CHANNEL if UPDATE_CHANNEL.startswith('http') else 'https://t.me/' + UPDATE_CHANNEL.lstrip('@')
-    page = (LANDING_HTML.replace('__BOTLINK__', f'https://t.me/{_BOT_USERNAME}' if _BOT_USERNAME else ch)
-            .replace('__CHANNEL__', html_lib.escape(ch)).replace('__YT__', html_lib.escape(YOUTUBE_CHANNEL))
-            .replace('__OWNER__', html_lib.escape(YOUR_USERNAME.lstrip('@')))
+    ch = _updates_url() or ''
+    contact = _contact_url() or ''
+    bot_link = f'https://t.me/{_BOT_USERNAME}' if _BOT_USERNAME else (ch or '#')
+    updates_btn = f'<a class="btn s" href="{html_lib.escape(ch)}">📢 Updates Channel</a>' if ch else ''
+    footer_links = []
+    if ch:
+        footer_links.append(f'<a href="{html_lib.escape(ch)}">Telegram Channel</a>')
+    if contact:
+        footer_links.append(f'<a href="{html_lib.escape(contact)}">Contact</a>')
+    page = (LANDING_HTML.replace('__BOTLINK__', html_lib.escape(bot_link))
+            .replace('__UPDATES_BTN__', updates_btn)
+            .replace('__FOOTER_LINKS__', ' &bull; '.join(footer_links) or '&nbsp;')
             .replace('__USERS__', str(len(active_users))).replace('__RUNNING__', str(len(_running_list())))
             .replace('__FILES__', str(sum(len(f) for f in user_files.values()))))
     return web.Response(text=page, content_type='text/html')
 
 async def keep_alive():
-    """Render free service ko sone se bachane ke liye khud ko ping karta hai"""
+    """Pings itself so the Render free service does not go to sleep"""
     url = os.getenv('RENDER_EXTERNAL_URL')
     if not url:
         return
@@ -2505,7 +2595,7 @@ async def keep_alive():
                     logger.info(f"Keep-alive ping: {r.status}")
         except Exception as e:
             logger.warning(f"Keep-alive failed: {e}")
-        await asyncio.sleep(600)  # har 10 minute
+        await asyncio.sleep(600)  # every 10 minutes
 
 async def web_server():
     app = web.Application()
