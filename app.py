@@ -3302,13 +3302,14 @@ async def main():
         await asyncio.to_thread(persist.flush)
         await dp.stop_polling()
 
-    loop = asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, lambda: background.append(asyncio.create_task(_graceful_shutdown())))
         except (NotImplementedError, RuntimeError):
             pass
 
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
