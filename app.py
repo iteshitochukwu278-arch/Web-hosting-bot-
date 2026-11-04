@@ -3296,13 +3296,13 @@ async def main():
         asyncio.create_task(_notify_owner_storage_status()),
     ]
 
-    # Render sends SIGTERM before a redeploy: save everything to MongoDB first
+        # Render sends SIGTERM before a redeploy: save everything to MongoDB first
     async def _graceful_shutdown():
         logger.info("Shutdown signal received - saving data to cloud storage...")
         await asyncio.to_thread(persist.flush)
         await dp.stop_polling()
 
-        loop = asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, lambda: background.append(asyncio.create_task(_graceful_shutdown())))
