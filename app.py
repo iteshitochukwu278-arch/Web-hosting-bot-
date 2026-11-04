@@ -449,7 +449,8 @@ async def callback_upload_file(callback: types.CallbackQuery):
 🔐 <code>.env</code> → your secrets/settings for your bot
 🖥️ Terminal: /term (pip install, ls, python bot.py ...)
 
-▶️ .py / .js files <b>start automatically</b> once uploaded.
+✏️ <b>Name a file first:</b> type a name like <code>.env</code> or <code>config.json</code>, then send any file - it is saved under that name.
+🚀 Upload all your files, then tap <b>Deploy / Start</b>. Nothing runs until you do.
 
 ━━━━━━━━━━━━━━━━━━━━
 <b>💡 How to Upload:</b>
@@ -503,8 +504,14 @@ Upload your first file to get started! 🚀
             is_favorite = file_name in user_favorites.get(user_id, [])
             star = "⭐" if is_favorite else "☆"
             
+            running = _is_running(user_id, file_name)
+            if running:
+                text = text.rstrip("\n") + "  🟢 <i>running</i>\n"
+                first = InlineKeyboardButton(text=f"🛑 Stop {file_name[:15]}", callback_data=f"stop_script:{user_id}_{file_name}")
+            else:
+                first = InlineKeyboardButton(text=f"▶️ Run {file_name[:15]}", callback_data=f"run_script:{file_name}")
             buttons.append([
-                InlineKeyboardButton(text=f"▶️ Run {file_name[:15]}", callback_data=f"run_script:{file_name}"),
+                first,
                 InlineKeyboardButton(text=f"{star}", callback_data=f"toggle_fav:{file_name}")
             ])
             buttons.append([
@@ -911,7 +918,9 @@ async def callback_file_info(callback: types.CallbackQuery):
 """
     
     back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="▶️ Run", callback_data=f"run_script:{file_name}"),
+        [InlineKeyboardButton(text="🛑 Stop" if _is_running(user_id, file_name) else "▶️ Run",
+                              callback_data=(f"stop_script:{user_id}_{file_name}" if _is_running(user_id, file_name)
+                                             else f"run_script:{file_name}")),
          InlineKeyboardButton(text="🗑️ Delete", callback_data=f"delete_file:{file_name}")],
         [InlineKeyboardButton(text="📁 My Files", callback_data="check_files"),
          InlineKeyboardButton(text="🏠 Home", callback_data="back_to_main")]
@@ -919,6 +928,105 @@ async def callback_file_info(callback: types.CallbackQuery):
     
     await callback.message.edit_text(text, reply_markup=back_keyboard, parse_mode="HTML")
     await callback.answer()
+
+
+# ---------- staged uploads: name a file first, upload several files, then Deploy ----------
+pending_names = {}   # user_id -> (file_name, timestamp): next document is saved under this name
+staged = {}          # user_id -> list of file names uploaded since the last deploy
+_NAME_RE = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
+_RESERVED_NAMES = {'.', '..', '.packages', 'node_modules', '__pycache__'}
+NAME_WAIT_SECONDS = 600
+DATA_FILE_MAX_MB = 20
+
+def _is_running(user_id, file_name):
+    info = bot_scripts.get(f"{user_id}_{file_name}")
+    try:
+        return bool(info) and info['process'].poll() is None
+    except Exception:
+        return False
+
+def _stage_add(user_id, file_name):
+    lst = staged.setdefault(user_id, [])
+    if file_name not in lst:
+        lst.append(file_name)
+
+def _stage_text(user_id):
+    names = staged.get(user_id, [])
+    if not names:
+        return ""
+    return ("\n\n📋 <b>Files in this project so far:</b>\n" + "\n".join(f"• <code>{html.escape(n)}</code>" for n in names)
+            + "\n\n📎 Send more files (type a file name such as <code>.env</code> first to save the next file under that name), "
+              "or tap <b>Deploy</b> when everything is uploaded.")
+
+def _stage_keyboard(user_id):
+    runnable = [n for n in staged.get(user_id, []) if n.lower().endswith(('.py', '.js'))]
+    rows = []
+    if len(runnable) == 1:
+        rows.append([InlineKeyboardButton(text=f"🚀 Deploy {runnable[0][:20]}", callback_data=f"deploy:{runnable[0]}")])
+    elif len(runnable) > 1:
+        for n in runnable:
+            rows.append([InlineKeyboardButton(text=f"🚀 Deploy {n[:20]}", callback_data=f"deploy:{n}")])
+        rows.append([InlineKeyboardButton(text="🚀 Deploy all", callback_data="deploy_all")])
+    rows.append([InlineKeyboardButton(text="📁 My Files", callback_data="check_files"),
+                 InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+@dp.message(F.text & ~F.text.startswith("/"))
+async def handle_file_name_text(message: types.Message):
+    """Customer types a file name (e.g. .env); the NEXT file they send is saved under that name."""
+    user_id = message.from_user.id
+    if user_id in banned_users or (bot_locked and user_id not in admin_ids):
+        return
+    name = (message.text or "").strip()
+    if not _NAME_RE.match(name) or name in _RESERVED_NAMES or name.startswith('..') or '.' not in name:
+        return
+    pending_names[user_id] = (name, time.time())
+    await message.answer(f"📎 Now send the file. Whatever file you send next will be saved as <code>{html.escape(name)}</code>.",
+                         parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("deploy:") | (F.data == "deploy_all"))
+async def callback_deploy(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if callback.data == "deploy_all":
+        names = [n for n in staged.get(user_id, []) if n.lower().endswith(('.py', '.js'))]
+    else:
+        names = [callback.data.split(":", 1)[1]]
+    if not names:
+        await callback.answer("Nothing to deploy. Upload a .py or .js file first.", show_alert=True)
+        return
+    await callback.answer("🚀 Deploying, please wait...")
+    for file_name in names:
+        note = await callback.message.answer(f"🚀 Starting <code>{html.escape(file_name)}</code> ...", parse_mode="HTML")
+        ok = await _restart_script(user_id, file_name)
+        key = f"{user_id}_{file_name}"
+        if ok:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🛑 Stop Script", callback_data=f"stop_script:{key}")],
+                [InlineKeyboardButton(text="📋 View Output", callback_data=f"view_log:{file_name}")],
+                [InlineKeyboardButton(text="📁 My Files", callback_data="check_files")]])
+            await note.edit_text(f"✅ <code>{html.escape(file_name)}</code> is running (PID {bot_scripts[key]['process'].pid}).\n"
+                                 f"You can stop it any time from 📁 My Files.", reply_markup=kb, parse_mode="HTML")
+            warn = customers.pop_error(user_id)
+            if warn:
+                await callback.message.answer(warn)
+        else:
+            await note.edit_text(f"❌ Could not start <code>{html.escape(file_name)}</code>. Check 📋 View Output in 📁 My Files.",
+                                 parse_mode="HTML")
+    staged.pop(user_id, None)
+
+async def _save_named_data_file(message, document, file_name):
+    """Any non-script file (config, data...) saved under the name the customer chose."""
+    user_id = message.from_user.id
+    if document.file_size and document.file_size > DATA_FILE_MAX_MB * 1024 * 1024:
+        await message.answer(f"❌ That file is too big (max {DATA_FILE_MAX_MB} MB).")
+        return
+    folder = UPLOAD_BOTS_DIR / str(user_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    await bot.download(document, destination=folder / file_name)
+    await _persist_now(user_id)
+    _stage_add(user_id, file_name)
+    await message.answer(f"✅ Saved as <code>{html.escape(file_name)}</code>." + _stage_text(user_id),
+                         reply_markup=_stage_keyboard(user_id), parse_mode="HTML")
 
 @dp.message(F.document)
 async def handle_document(message: types.Message):
@@ -934,13 +1042,26 @@ async def handle_document(message: types.Message):
     
     document = message.document
     file_name = os.path.basename((document.file_name or '').replace('\\', '/')) or 'file'
+    chosen = pending_names.pop(user_id, None)
+    if chosen and time.time() - chosen[1] <= NAME_WAIT_SECONDS:
+        file_name = chosen[0]          # the customer named this file first: use that name
+    else:
+        chosen = None
     file_ext = os.path.splitext(file_name)[1].lower()
 
     special = _special_kind(file_name)
     if special:
         await _handle_special_upload(message, document, special)
         return
-    
+
+    if chosen and file_ext not in ['.py', '.js', '.zip']:
+        try:
+            await _save_named_data_file(message, document, file_name)
+        except Exception as e:
+            logger.error(f"named upload failed: {e}", exc_info=True)
+            await message.answer(f"❌ Failed: {html.escape(str(e))}", parse_mode="HTML")
+        return
+
     if file_ext not in ['.py', '.js', '.zip']:
         await message.answer("❌ Supported files: .py, .js, .zip, requirements.txt, package.json and .env")
         return
@@ -990,7 +1111,10 @@ async def handle_document(message: types.Message):
         if user_id not in user_files:
             user_files[user_id] = []
         
+        user_files[user_id] = [f for f in user_files[user_id] if f[0] != file_name]
         user_files[user_id].append((file_name, file_ext[1:]))
+        if file_ext in ('.py', '.js'):
+            _stage_add(user_id, file_name)
         
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
@@ -1025,7 +1149,7 @@ async def handle_document(message: types.Message):
             ])
         else:
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="▶️ Run Now", callback_data=f"run_script:{file_name}"),
+                [InlineKeyboardButton(text="🚀 Deploy / Start", callback_data=f"deploy:{file_name}"),
                  InlineKeyboardButton(text="⭐ Add Favorite", callback_data=f"toggle_fav:{file_name}")],
                 [InlineKeyboardButton(text="ℹ️ File Info", callback_data=f"file_info:{file_name}"),
                  InlineKeyboardButton(text="🗑️ Delete", callback_data=f"delete_file:{file_name}")],
@@ -1045,16 +1169,11 @@ async def handle_document(message: types.Message):
 📊 <b>Usage:</b> {current_files + 1} files (Unlimited ♾️)
 
 🎉 File uploaded successfully!
-""",
+""" + _stage_text(user_id),
             reply_markup=keyboard,
             parse_mode="HTML"
         )
 
-        if file_ext in ('.py', '.js'):
-            try:
-                await _auto_run_after_upload(message, user_id, file_name)
-            except Exception as auto_err:
-                logger.error(f"auto-run failed: {auto_err}", exc_info=True)
     except Exception as e:
         logger.error(f"Error uploading file: {e}")
         await message.answer(f"❌ Upload failed: {str(e)}")
@@ -1323,6 +1442,9 @@ async def callback_stop_script(callback: types.CallbackQuery):
     if script_key not in bot_scripts:
         await callback.answer("❌ Script not found or already stopped!", show_alert=True)
         return
+    if bot_scripts[script_key].get('script_owner_id') != callback.from_user.id and callback.from_user.id not in admin_ids:
+        await callback.answer("❌ This script belongs to another user.", show_alert=True)
+        return
     
     try:
         script_info = bot_scripts[script_key]
@@ -1342,7 +1464,7 @@ async def callback_stop_script(callback: types.CallbackQuery):
         if callback.from_user.id in admin_ids:
             await callback.message.edit_text("🛑 Script stopped!", parse_mode="HTML")
         else:
-            await callback_back_to_main(callback)
+            await callback_check_files(callback)
         
     except Exception as e:
         logger.error(f"Error stopping script: {e}")
@@ -1487,6 +1609,17 @@ async def callback_delete_file(callback: types.CallbackQuery):
     file_path = user_folder / file_name
     
     try:
+        script_key = f"{user_id}_{file_name}"
+        if script_key in bot_scripts:
+            info = bot_scripts.get(script_key)
+            lf = info.get('log_file') if info else None
+            if lf and not lf.closed:
+                lf.close()
+            _note_stop(script_key)
+            await asyncio.to_thread(_terminate_tree, info['process'].pid)
+            bot_scripts.pop(script_key, None)
+        await asyncio.to_thread(_kill_orphans, file_path)
+        staged.get(user_id, []) and file_name in staged[user_id] and staged[user_id].remove(file_name)
         if file_path.exists():
             file_path.unlink()
         
@@ -2827,9 +2960,11 @@ async def _handle_special_upload(message, document, kind):
         if kind == 'env':
             n = len(_user_dotenv(user_id))
             restarted = await _restart_user_scripts(user_id)
+            _stage_add(user_id, '.env')
             await message.answer(f"🔐 <b>.env saved</b> ({n} variable(s)). It is given to your bot when it starts."
-                                 + (f"\n♻️ Restarted {restarted} running bot(s) to use it." if restarted else ""),
-                                 parse_mode="HTML")
+                                 + (f"\n♻️ Restarted {restarted} running bot(s) to use it." if restarted else "")
+                                 + _stage_text(user_id),
+                                 reply_markup=_stage_keyboard(user_id), parse_mode="HTML")
             return
         label = 'requirements.txt' if kind == 'requirements' else 'package.json'
         status = await message.answer(f"📦 <b>{label} saved.</b> Installing packages, this can take a minute ...",
@@ -2844,7 +2979,10 @@ async def _handle_special_upload(message, document, kind):
             restarted = await _restart_user_scripts(user_id)
         text = (f"✅ <b>Packages installed.</b>" + (f"\n♻️ Restarted {restarted} running bot(s)." if restarted else "")
                 if ok else f"❌ <b>Install failed</b>\n<pre>{html.escape(out[-900:])}</pre>")
-        await status.edit_text(text, parse_mode="HTML")
+        if ok:
+            _stage_add(user_id, target.name)
+            text += _stage_text(user_id)
+        await status.edit_text(text, reply_markup=_stage_keyboard(user_id) if ok else None, parse_mode="HTML")
     except Exception as e:
         logger.error(f"special upload failed: {e}", exc_info=True)
         await message.answer(f"❌ Failed: {html.escape(str(e))}", parse_mode="HTML")
