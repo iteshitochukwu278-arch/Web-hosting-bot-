@@ -17,6 +17,22 @@ services:
         sync: false
       - key: ADMIN_PASSWORD
         sync: false
+      - key: FLEET_SECRET
+        sync: false
+      # Render has no Docker daemon, so hosted bots run as subprocesses.
+      # Only let people you trust upload bots (see README / chat notes).
+      - key: BOT_EXECUTION_MODE
+        value: subprocess
+      - key: BOT_ALLOW_UNSAFE_SUBPROCESS
+        value: "true"
+      - key: BOT_CPU_QUOTA
+        value: "1.0"
+      - key: BOT_MEMORY_MB
+        value: "512"
+      - key: BOT_PIDS_LIMIT
+        value: "64"
+      - key: MAX_BOTS_PER_USER
+        value: "5"
       - key: MONGO_URI
         sync: false
       - key: MONGO_DB_NAME

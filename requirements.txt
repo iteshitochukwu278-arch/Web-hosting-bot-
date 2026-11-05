@@ -27,3 +27,5 @@ websocket-client>=1.8.0
 dnspython>=2.6.1
 PyMySQL>=1.1.1
 psycopg2-binary>=2.9.9
+
+cryptography>=42.0.0

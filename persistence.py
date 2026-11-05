@@ -34,6 +34,8 @@ log = logging.getLogger("persistence")
 
 EXCLUDED_DIRS = {'__pycache__', 'node_modules', '.git', 'venv', '.venv', '.cache', '.npm', 'site-packages', '.packages'}
 EXCLUDED_SUFFIXES = {'.log', '.pyc'}
+# Runtime env files contain decrypted customer bot tokens; never replicate them to cloud storage.
+EXCLUDED_NAMES = {'runtime.env'}
 MAX_FILE_BYTES = int(os.getenv('PERSIST_MAX_FILE_MB', '25')) * 1024 * 1024
 TELEGRAM_SEND_LIMIT = 49 * 1024 * 1024          # Telegram bots can send files up to 50 MB
 DB_EXPORT_CAP_BYTES = 30 * 1024 * 1024
@@ -41,6 +43,8 @@ DB_EXPORT_CAP_BYTES = 30 * 1024 * 1024
 
 def _is_excluded(rel_parts):
     if any(p in EXCLUDED_DIRS for p in rel_parts[:-1]):
+        return True
+    if rel_parts[-1] in EXCLUDED_NAMES:
         return True
     return Path(rel_parts[-1]).suffix.lower() in EXCLUDED_SUFFIXES
 
@@ -142,6 +146,11 @@ class Persistence:
             rel = _safe_rel(getattr(f, 'rel', '') or '')
             uid = getattr(f, 'uid', None)
             if rel is None or uid is None:
+                continue
+            if _is_excluded(Path(rel).parts):
+                # Purge previously synced plaintext runtime.env files from GridFS.
+                try: self._fs.delete(f._id)
+                except Exception: pass
                 continue
             target = self.upload_dir / str(uid) / rel
             users.add(uid)

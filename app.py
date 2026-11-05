@@ -26,6 +26,7 @@ from pathlib import Path
 from dotenv import load_dotenv, dotenv_values
 from persistence import Persistence
 from customer_dbs import CustomerDBs, load_servers_from_env, LABELS, EMOJI
+from bot_fleet import BotFleet, FleetError
 
 load_dotenv()
 
@@ -72,6 +73,13 @@ IROTECH_DIR.mkdir(exist_ok=True)
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+FLEET_SECRET = os.getenv('FLEET_SECRET', '').strip()
+if len(FLEET_SECRET) < 32:
+    raise RuntimeError('Set a dedicated stable FLEET_SECRET (at least 32 characters) before starting; do not reuse BOT_TOKEN or DB_SECRET.')
+fleet = BotFleet(UPLOAD_BOTS_DIR / '0' / 'fleet', DATABASE_PATH, FLEET_SECRET, int(os.getenv('MAX_BOTS_PER_USER', '5')))
+pending_fleet_token = {}
+pending_fleet_upload = {}
+pending_fleet_env = {}
 BOT_START_TIME = datetime.now()
 
 bot_scripts = {}
@@ -120,7 +128,13 @@ def init_db():
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS subscriptions
-                     (user_id INTEGER PRIMARY KEY, expiry TEXT)''')
+                     (user_id INTEGER PRIMARY KEY, expiry TEXT, plan_name TEXT DEFAULT 'Premium', assigned_by INTEGER)''')
+        # Backward-compatible subscription metadata migration.
+        sub_cols = [row[1] for row in c.execute('PRAGMA table_info(subscriptions)').fetchall()]
+        if 'plan_name' not in sub_cols:
+            c.execute("ALTER TABLE subscriptions ADD COLUMN plan_name TEXT DEFAULT 'Premium'")
+        if 'assigned_by' not in sub_cols:
+            c.execute('ALTER TABLE subscriptions ADD COLUMN assigned_by INTEGER')
         c.execute('''CREATE TABLE IF NOT EXISTS user_files
                      (user_id INTEGER, file_name TEXT, file_type TEXT, upload_date TEXT,
                       PRIMARY KEY (user_id, file_name))''')
@@ -154,10 +168,10 @@ def load_data():
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
         
-        c.execute('SELECT user_id, expiry FROM subscriptions')
-        for user_id, expiry in c.fetchall():
+        c.execute("SELECT user_id, expiry, COALESCE(plan_name, 'Premium') FROM subscriptions")
+        for user_id, expiry, plan_name in c.fetchall():
             try:
-                user_subscriptions[user_id] = {'expiry': datetime.fromisoformat(expiry)}
+                user_subscriptions[user_id] = {'expiry': datetime.fromisoformat(expiry), 'plan': plan_name or 'Premium'}
             except ValueError:
                 logger.warning(f"Invalid expiry date for user {user_id}")
         
@@ -971,10 +985,221 @@ def _stage_keyboard(user_id):
                  InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+@dp.message(Command("fleetadmin"))
+async def cmd_fleetadmin(message: types.Message):
+    if message.from_user.id not in admin_ids:
+        return
+    args=(message.text or '').split()
+    if len(args)==1:
+        with fleet._conn() as c: rows=c.execute('SELECT id,owner_id,name,username,status,disabled FROM hosted_bots ORDER BY created_at DESC LIMIT 100').fetchall()
+        lines=[f"{r['id']} | owner {r['owner_id']} | @{r['username']} | {r['status']} | disabled={r['disabled']}" for r in rows]
+        await message.answer("<b>Fleet admin</b>\n"+html.escape("\n".join(lines) or "No bots")+"\nUse /fleetadmin stop|disable|enable BOT_ID, suspend|activate USER_ID, limit USER_ID COUNT, or plan USER_ID COUNT DAYS",parse_mode="HTML")
+        return
+    if len(args)==3 and args[1] in ('suspend','activate'):
+        try:
+            uid=int(args[2])
+            fleet.set_account(uid, suspended=(args[1]=='suspend'))
+            await message.answer(f"Customer {uid}: {args[1]}. Developed by Marvel")
+        except (ValueError, FleetError) as e:
+            await message.answer(f"Invalid customer ID: {html.escape(str(e))}")
+        return
+    if len(args)==5 and args[1]=='plan':
+        try:
+            uid, limit, days=int(args[2]),int(args[3]),int(args[4])
+            expires=fleet.set_plan(uid,'custom',limit,days)
+            await message.answer(f"Customer {uid}: custom plan, {limit} bots, expires {datetime.fromtimestamp(expires).strftime('%Y-%m-%d')}. Developed by Marvel")
+        except (ValueError,FleetError) as e: await message.answer(f"Invalid plan: {html.escape(str(e))}")
+        return
+    if len(args)==4 and args[1]=='limit':
+        try:
+            uid, limit=int(args[2]), int(args[3])
+            fleet.set_account(uid, bot_limit=limit)
+            await message.answer(f"Customer {uid} bot limit set to {limit}. Developed by Marvel")
+        except (ValueError, FleetError) as e:
+            await message.answer(f"Invalid limit: {html.escape(str(e))}")
+        return
+    if len(args)!=3 or args[1] not in ('stop','disable','enable'):
+        await message.answer("Usage: /fleetadmin stop|disable|enable BOT_ID | suspend|activate USER_ID | limit USER_ID COUNT | plan USER_ID COUNT DAYS"); return
+    action,bid=args[1],args[2]
+    try:
+        b=fleet.get_bot(message.from_user.id,bid,admin=True)
+        if action=='stop': fleet.stop(int(b['owner_id']),bid,admin=True)
+        elif action=='disable': fleet.set_disabled(bid,True)
+        else: fleet.set_disabled(bid,False)
+        await message.answer(f"Done: {action} {bid}. Developed by Marvel")
+    except FleetError as e: await message.answer(str(e))
+
+@dp.message(Command("mybots"))
+async def cmd_mybots(message: types.Message):
+    await _send_fleet_list(message, message.from_user.id)
+
+@dp.message(Command("addbot"))
+async def cmd_addbot(message: types.Message):
+    uid = message.from_user.id
+    if fleet.account(uid)['suspended']:
+        await message.answer("Your hosting account is suspended. Contact support.")
+        return
+    if len(fleet.list_bots(uid)) >= fleet.owner_limit(uid):
+        await message.answer(f"Bot limit reached ({fleet.owner_limit(uid)}).")
+        return
+    pending_fleet_token[uid] = True
+    await message.answer("Send your Telegram bot token from @BotFather. I will verify it with Telegram before accepting files.")
+
+async def _send_fleet_list(message, uid):
+    bots = fleet.list_bots(uid)
+    rows = [[InlineKeyboardButton(text=f"🤖 {b['name']} (@{b['username']}) — {b['status']}", callback_data=f"fleet_manage:{b['id']}")] for b in bots]
+    rows.append([InlineKeyboardButton(text="➕ Add bot", callback_data="fleet_add")])
+    text = "<b>My hosted bots</b>\n" + ("\n".join(f"• {html.escape(b['name'])} (@{html.escape(b['username'])}) — {b['status']}" for b in bots) if bots else "No bots hosted yet.")
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+
+@dp.callback_query(F.data == "fleet_add")
+async def fleet_add_callback(callback: types.CallbackQuery):
+    pending_fleet_token[callback.from_user.id] = True
+    await callback.message.answer("Send your Telegram bot token from @BotFather for verification.")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("fleet_manage:"))
+async def fleet_manage_callback(callback: types.CallbackQuery):
+    uid = callback.from_user.id; bid = callback.data.split(":",1)[1]
+    try: b = fleet.get_bot(uid, bid)
+    except FleetError as e: await callback.answer(str(e), show_alert=True); return
+    files = fleet.files(uid, bid)
+    rows = [[InlineKeyboardButton(text="📤 Upload/replace file", callback_data=f"fleet_upload:{bid}"), InlineKeyboardButton(text="📂 Files", callback_data=f"fleet_files:{bid}")],
+            [InlineKeyboardButton(text="▶️ Start", callback_data=f"fleet_start:{bid}"), InlineKeyboardButton(text="⏹ Stop", callback_data=f"fleet_stop:{bid}")],
+            [InlineKeyboardButton(text="📋 Logs", callback_data=f"fleet_logs:{bid}"), InlineKeyboardButton(text="💾 Backup", callback_data=f"fleet_backup:{bid}")],
+            [InlineKeyboardButton(text="⚙️ Environment", callback_data=f"fleet_env:{bid}"), InlineKeyboardButton(text="📊 Usage", callback_data=f"fleet_usage:{bid}")],
+            [InlineKeyboardButton(text="🔙 My bots", callback_data="fleet_list")]]
+    await callback.message.answer(f"<b>{html.escape(b['name'])}</b> (@{html.escape(b['username'])})\nStatus: {b['status']}\nFiles: {', '.join(html.escape(x) for x in files) or 'none'}", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("fleet_files:"))
+async def fleet_files_callback(callback: types.CallbackQuery):
+    bid=callback.data.split(":",1)[1]; uid=callback.from_user.id
+    try:
+        names=fleet.files(uid,bid)
+        rows=[[InlineKeyboardButton(text=f"🗑 {name}",callback_data=f"fleet_delete:{bid}:{name}")] for name in names if name not in {"bot.log"}]
+        rows.append([InlineKeyboardButton(text="🔙 Manage bot",callback_data=f"fleet_manage:{bid}")])
+        await callback.message.answer("<b>Bot files</b>\nTap a file to delete it (a backup version is kept).\n"+("\n".join("• <code>"+html.escape(n)+"</code>" for n in names) or "No files yet."),reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),parse_mode="HTML")
+    except FleetError as e: await callback.answer(str(e),show_alert=True); return
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("fleet_delete:"))
+async def fleet_delete_callback(callback: types.CallbackQuery):
+    parts=callback.data.split(":",2); bid,name=parts[1],parts[2]; uid=callback.from_user.id
+    try:
+        fleet.delete_file(uid,bid,name)
+        await callback.answer(f"Deleted {name}; a version backup was retained.",show_alert=True)
+        await callback.message.answer("File deleted. Use /mybots to manage the bot.")
+    except FleetError as e: await callback.answer(str(e),show_alert=True)
+
+@dp.callback_query(F.data.startswith("fleet_backup:"))
+async def fleet_backup_callback(callback: types.CallbackQuery):
+    bid=callback.data.split(":",1)[1]
+    try:
+        path=await asyncio.to_thread(fleet.create_backup,callback.from_user.id,bid)
+        await callback.message.answer_document(FSInputFile(path),caption="Bot backup · Developed by Marvel")
+        await callback.answer("Backup created")
+    except (FleetError, OSError) as e: await callback.answer(str(e),show_alert=True)
+
+@dp.callback_query(F.data.startswith("fleet_env:"))
+async def fleet_env_callback(callback: types.CallbackQuery):
+    bid=callback.data.split(":",1)[1]
+    try: names=fleet.environment_names(callback.from_user.id,bid)
+    except FleetError as e: await callback.answer(str(e),show_alert=True); return
+    await callback.message.answer("<b>Environment variables</b>\nNames: "+(", ".join("<code>"+html.escape(n)+"</code>" for n in names) or "none")+"\nSet: <code>/botenv "+bid+" KEY value</code>\nRemove: <code>/botenvdel "+bid+" KEY</code>\nValues are encrypted and never displayed.",parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("fleet_usage:"))
+async def fleet_usage_callback(callback: types.CallbackQuery):
+    bid=callback.data.split(":",1)[1]
+    try: u=fleet.resource_usage(callback.from_user.id,bid)
+    except FleetError as e: await callback.answer(str(e),show_alert=True); return
+    await callback.message.answer(f"<b>Resource usage</b>\nStatus: {u['status']}\nPID: {u['pid'] or '—'}\nCPU: {u['cpu_percent']:.1f}%\nRAM: {u['memory_mb']:.1f} MB\nDeveloped by Marvel",parse_mode="HTML")
+    await callback.answer()
+
+@dp.message(Command("botenv"))
+async def cmd_botenv(message: types.Message):
+    args=(message.text or "").split(maxsplit=2)
+    if len(args)<3:
+        await message.answer("Usage: /botenv BOT_ID KEY value"); return
+    try:
+        fleet.set_environment(message.from_user.id,args[1],args[2].split(maxsplit=1)[0],args[2].split(maxsplit=1)[1] if len(args[2].split(maxsplit=1))>1 else "")
+        await message.answer("Environment variable saved (value encrypted). Running bot restarted if needed. Developed by Marvel")
+    except (FleetError,IndexError) as e: await message.answer(html.escape(str(e)))
+
+@dp.message(Command("botenvdel"))
+async def cmd_botenvdel(message: types.Message):
+    args=(message.text or "").split()
+    if len(args)!=3: await message.answer("Usage: /botenvdel BOT_ID KEY"); return
+    try: fleet.delete_environment(message.from_user.id,args[1],args[2]); await message.answer("Environment variable removed.")
+    except FleetError as e: await message.answer(html.escape(str(e)))
+
+@dp.message(Command("botversions"))
+async def cmd_botversions(message: types.Message):
+    args=(message.text or "").split()
+    if len(args)!=3: await message.answer("Usage: /botversions BOT_ID filename"); return
+    try:
+        versions=fleet.file_versions(message.from_user.id,args[1],args[2])
+        lines=[f"v{x['version']} — {datetime.fromtimestamp(x['created_at']).strftime('%Y-%m-%d %H:%M')} — /botrestore {args[1]} {args[2]} {x['version']}" for x in versions]
+        await message.answer("<b>File versions</b>\n"+html.escape("\n".join(lines) or "No saved versions."),parse_mode="HTML")
+    except FleetError as e: await message.answer(html.escape(str(e)))
+
+@dp.message(Command("botrestore"))
+async def cmd_botrestore(message: types.Message):
+    args=(message.text or "").split()
+    if len(args)!=4: await message.answer("Usage: /botrestore BOT_ID filename VERSION"); return
+    try: fleet.restore_file_version(message.from_user.id,args[1],args[2],int(args[3])); await message.answer("File version restored. Running bot restarted if needed.")
+    except (FleetError,ValueError) as e: await message.answer(html.escape(str(e)))
+
+@dp.callback_query(F.data == "fleet_list")
+async def fleet_list_callback(callback: types.CallbackQuery):
+    await _send_fleet_list(callback.message, callback.from_user.id); await callback.answer()
+
+@dp.callback_query(F.data.startswith("fleet_upload:"))
+async def fleet_upload_callback(callback: types.CallbackQuery):
+    bid=callback.data.split(":",1)[1]
+    try: fleet.get_bot(callback.from_user.id,bid)
+    except FleetError as e: await callback.answer(str(e),show_alert=True); return
+    pending_fleet_upload[callback.from_user.id]=bid
+    await callback.message.answer("Send the file to add or replace it in this bot only (e.g. bot.py, config.py).")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("fleet_start:"))
+async def fleet_start_callback(callback: types.CallbackQuery):
+    try: result=fleet.start(callback.from_user.id,callback.data.split(":",1)[1])
+    except FleetError as e: await callback.answer(str(e),show_alert=True); return
+    await callback.answer(f"Started (PID {result['pid']})",show_alert=True)
+
+@dp.callback_query(F.data.startswith("fleet_stop:"))
+async def fleet_stop_callback(callback: types.CallbackQuery):
+    try: fleet.stop(callback.from_user.id,callback.data.split(":",1)[1])
+    except FleetError as e: await callback.answer(str(e),show_alert=True); return
+    await callback.answer("Bot stopped",show_alert=True)
+
+@dp.callback_query(F.data.startswith("fleet_logs:"))
+async def fleet_logs_callback(callback: types.CallbackQuery):
+    bid=callback.data.split(":",1)[1]
+    try: logs=fleet.log_tail(callback.from_user.id,bid)
+    except FleetError as e: await callback.answer(str(e),show_alert=True); return
+    await callback.message.answer("<b>Bot logs</b>\n<pre>"+html.escape(logs[-3500:] or "No logs yet")+"</pre>",parse_mode="HTML")
+    await callback.answer()
+
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_file_name_text(message: types.Message):
     """Customer types a file name (e.g. .env); the NEXT file they send is saved under that name."""
     user_id = message.from_user.id
+    if user_id in pending_fleet_token:
+        token = (message.text or '').strip()
+        try:
+            try: await message.delete()
+            except Exception: pass
+            verified = await fleet.verify_token(token)
+            record = fleet.add_verified(user_id, token, verified)
+            pending_fleet_token.pop(user_id, None)
+            await message.answer(f"✅ Verified @{html.escape(record['username'])} ({html.escape(record['name'])}). Now open /mybots and upload its files.\nDeveloped by Marvel", parse_mode="HTML")
+        except FleetError as e:
+            await message.answer(f"❌ {html.escape(str(e))} Send a valid token or /cancel.", parse_mode="HTML")
+        return
     if user_id in banned_users or (bot_locked and user_id not in admin_ids):
         return
     name = (message.text or "").strip()
@@ -1041,6 +1266,18 @@ async def handle_document(message: types.Message):
         return
     
     document = message.document
+    if user_id in pending_fleet_upload:
+        bid = pending_fleet_upload.pop(user_id)
+        file_name = os.path.basename((document.file_name or 'file').replace('\\', '/')) or 'file'
+        try:
+            file = await bot.get_file(document.file_id)
+            stream = await bot.download_file(file.file_path)
+            data = stream.read() if hasattr(stream, 'read') else bytes(stream)
+            fleet.save_file(user_id, bid, file_name, data)
+            await message.answer(f"✅ Saved <code>{html.escape(file_name)}</code> to this bot only. Restart it from /mybots to apply changes.\nDeveloped by Marvel", parse_mode="HTML")
+        except FleetError as e:
+            await message.answer(f"❌ {html.escape(str(e))}", parse_mode="HTML")
+        return
     file_name = os.path.basename((document.file_name or '').replace('\\', '/')) or 'file'
     chosen = pending_names.pop(user_id, None)
     if chosen and time.time() - chosen[1] <= NAME_WAIT_SECONDS:
@@ -1188,6 +1425,8 @@ _HOST_ONLY_ENV = (
     'PORT', 'RENDER_EXTERNAL_URL', 'DATABASE_PATH', 'WEB_CONCURRENCY',
     'MONGO_URI', 'MONGO_DB_NAME', 'PERSIST_MAX_FILE_MB', 'DB_SECRET', 'DB_MAX_PER_SERVER',
     'MONGO_MAX_PER_SERVER', 'MYSQL_MAX_PER_SERVER', 'POSTGRES_MAX_PER_SERVER',
+    'FLEET_SECRET', 'MAX_BOTS_PER_USER', 'BOT_EXECUTION_MODE', 'BOT_ALLOW_UNSAFE_SUBPROCESS',
+    'BOT_DOCKER_IMAGE', 'BOT_DOCKER_NETWORK', 'BOT_CONTAINER_USER',
 )
 
 def _child_env(user_id=None):
@@ -2262,12 +2501,12 @@ async def cmd_add_premium(message: types.Message):
             return
         
         expiry = datetime.now() + timedelta(days=days)
-        user_subscriptions[user_id] = {'expiry': expiry}
+        user_subscriptions[user_id] = {'expiry': expiry, 'plan': 'Premium'}
         
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
-        c.execute('INSERT OR REPLACE INTO subscriptions (user_id, expiry) VALUES (?, ?)',
-                  (user_id, expiry.isoformat()))
+        c.execute('INSERT OR REPLACE INTO subscriptions (user_id, expiry, plan_name, assigned_by) VALUES (?, ?, ?, ?)',
+                  (user_id, expiry.isoformat(), 'Premium', message.from_user.id))
         conn.commit()
         conn.close()
         
@@ -2553,6 +2792,14 @@ def _running_list():
             pass
     return out
 
+def _fleet_panel_rows():
+    try:
+        with fleet._conn() as conn:
+            return [dict(r) for r in conn.execute(
+                'SELECT id,owner_id,name,username,status,disabled,created_at FROM hosted_bots ORDER BY created_at DESC LIMIT 500').fetchall()]
+    except Exception:
+        return []
+
 def _collect():
     now = datetime.now()
     running = _running_list()
@@ -2565,6 +2812,8 @@ def _collect():
             users.append({'id': uid, 'joined': (jd or '-')[:16].replace('T', ' '), 'last': (la or '-')[:16].replace('T', ' '),
                           'files': len(user_files.get(uid, [])), 'banned': uid in banned_users, 'admin': uid in admin_ids,
                           'sub': uid in user_subscriptions and user_subscriptions[uid]['expiry'] > now,
+                          'plan': user_subscriptions.get(uid, {}).get('plan', 'Free') if user_subscriptions.get(uid, {}).get('expiry', now) > now else 'Free',
+                          'expiry': user_subscriptions.get(uid, {}).get('expiry').strftime('%Y-%m-%d') if user_subscriptions.get(uid, {}).get('expiry') else '',
                           'running': sum(1 for r in running if r['owner'] == uid)})
         conn.close()
     except Exception as e:
@@ -2599,7 +2848,9 @@ def _collect():
             'uploads': bot_stats.get('total_uploads', 0), 'downloads': bot_stats.get('total_downloads', 0),
             'runs': bot_stats.get('total_runs', 0), 'locked': bot_locked,
             'uptime': f"{up.days}d {up.seconds // 3600}h {(up.seconds % 3600) // 60}m",
-            'files_list': [{'owner': u, 'name': f[0], 'type': f[1], 'on': f'{u}_{f[0]}' in bot_scripts and bot_scripts[f'{u}_{f[0]}']['process'].poll() is None} for u, fl in user_files.items() for f in fl][:500], 'ram_mb': ram, 'cpu': psutil.cpu_percent(interval=None), 'running': running, 'users': users, 'types': types, 'top': top, **extra}
+            'files_list': [{'owner': u, 'name': f[0], 'type': f[1], 'on': f'{u}_{f[0]}' in bot_scripts and bot_scripts[f'{u}_{f[0]}']['process'].poll() is None} for u, fl in user_files.items() for f in fl][:500], 'ram_mb': ram, 'cpu': psutil.cpu_percent(interval=None), 'running': running,
+            'fleet_bots': _fleet_panel_rows(),
+            'users': users, 'types': types, 'top': top, **extra}
 
 def _stop_script(key):
     info = bot_scripts.get(key)
@@ -2650,6 +2901,66 @@ async def panel_action(request):
         uid = int(d['user_id']) if d.get('user_id') not in (None, '') else None
     except Exception:
         return web.json_response({'ok': False, 'msg': 'Invalid data'}, status=400)
+
+    if act in ('fleet_stop', 'fleet_disable', 'fleet_enable'):
+        bid = str(d.get('bot_id') or '')
+        try:
+            b = fleet.get_bot(0, bid, admin=True)
+            if act == 'fleet_stop':
+                fleet.stop(int(b['owner_id']), bid, admin=True)
+            elif act == 'fleet_disable':
+                fleet.set_disabled(bid, True)
+            else:
+                fleet.set_disabled(bid, False)
+            return web.json_response({'ok': True, 'msg': f'{act} completed'})
+        except FleetError as e:
+            return web.json_response({'ok': False, 'msg': str(e)}, status=400)
+    if act in ('fleet_suspend', 'fleet_activate', 'fleet_limit'):
+        if uid is None:
+            return web.json_response({'ok': False, 'msg': 'User ID required'}, status=400)
+        try:
+            if act == 'fleet_suspend':
+                fleet.set_account(uid, suspended=True)
+            elif act == 'fleet_activate':
+                fleet.set_account(uid, suspended=False)
+            else:
+                fleet.set_account(uid, bot_limit=int(d.get('limit')))
+            return web.json_response({'ok': True, 'msg': f'{act} completed'})
+        except (FleetError, TypeError, ValueError) as e:
+            return web.json_response({'ok': False, 'msg': str(e)}, status=400)
+
+    if act == 'assign_plan':
+        if uid is None:
+            return web.json_response({'ok': False, 'msg': 'User ID required'}, status=400)
+        plan = str(d.get('plan') or '').strip().title()
+        plan_limits = {'Free': 5, 'Starter': 10, 'Pro': 25, 'Business': 100, 'Premium': 5}
+        if plan not in plan_limits:
+            return web.json_response({'ok': False, 'msg': 'Unknown plan'}, status=400)
+        try:
+            days = int(d.get('days', 30))
+            if days < 1 or days > 3650:
+                raise ValueError
+        except (TypeError, ValueError):
+            return web.json_response({'ok': False, 'msg': 'Duration must be 1–3650 days'}, status=400)
+        expiry = datetime.now() + timedelta(days=days)
+        user_subscriptions[uid] = {'expiry': expiry, 'plan': plan}
+        _db('INSERT OR REPLACE INTO subscriptions (user_id, expiry, plan_name, assigned_by) VALUES (?, ?, ?, ?)',
+            (uid, expiry.isoformat(), plan, OWNER_ID))
+        try:
+            fleet.set_plan(uid, plan.lower(), plan_limits[plan], days)
+        except Exception as e:
+            logger.warning(f'Could not sync fleet plan limit for {uid}: {e}')
+        return web.json_response({'ok': True, 'msg': f'{plan} assigned to {uid} for {days} days (expires {expiry:%Y-%m-%d})'})
+    if act == 'remove_plan':
+        if uid is None:
+            return web.json_response({'ok': False, 'msg': 'User ID required'}, status=400)
+        user_subscriptions.pop(uid, None)
+        _db('DELETE FROM subscriptions WHERE user_id = ?', (uid,))
+        try:
+            fleet.set_plan(uid, 'free', 5, 3650)
+        except Exception as e:
+            logger.warning(f'Could not reset fleet plan limit for {uid}: {e}')
+        return web.json_response({'ok': True, 'msg': f'Subscription removed for {uid}; default 5-bot limit restored'})
 
     if act in ('ban', 'unban', 'stop_user') and uid is None:
         return web.json_response({'ok': False, 'msg': 'User ID required'})
@@ -2743,10 +3054,11 @@ h=`<div class="grid">${card('👥 Total Members',D.total_users)}${card('🆕 New
 <h3>🤖 Currently running bots</h3>`+bots()}
 if(P=='bots')h=bots();
 if(P=='files')h=`<input placeholder="🔍 Search file or user ID..." value="${esc(Q)}" oninput="Q=this.value;render()" style="margin-bottom:10px"><div class="box wrap"><table><tr><th>User</th><th>File</th><th>Type</th><th>Status</th></tr>`+(D.files_list.filter(f=>(f.name+f.owner).toLowerCase().includes(Q.toLowerCase())).map(f=>`<tr><td>${f.owner}</td><td>${esc(f.name)}</td><td>${esc(f.type)}</td><td><span class="tag ${f.on?'t-on':'t-off'}">${f.on?'Running':'Stopped'}</span></td></tr>`).join('')||'<tr><td colspan=4>No files</td></tr>')+`</table></div>`;
-if(P=='users')h=`<input placeholder="🔍 Search user ID..." value="${esc(Q)}" oninput="Q=this.value;render()" style="margin-bottom:10px"><div class="box wrap"><table><tr><th>User ID</th><th>Joined</th><th>Last active</th><th>Files</th><th>Run</th><th>Tags</th><th></th></tr>`+(D.users.filter(u=>String(u.id).includes(Q)).map(u=>`<tr><td>${u.id}</td><td>${esc(u.joined)}</td><td>${esc(u.last)}</td><td>${u.files}</td><td>${u.running}</td><td>${u.banned?'🚫':''}${u.admin?'👑':''}</td><td>${u.banned?`<button class="a g" onclick="act({action:'unban',user_id:${u.id}})">Unban</button>`:`<button class="a r" onclick="act({action:'ban',user_id:${u.id}})">Ban</button>`} <button class="a" onclick="act({action:'stop_user',user_id:${u.id}})">Stop bots</button></td></tr>`).join('')||'<tr><td colspan=7>No users</td></tr>')+`</table></div>`;
+if(P=='users')h=`<input placeholder="🔍 Search user ID..." value="${esc(Q)}" oninput="Q=this.value;render()" style="margin-bottom:10px"><div class="box wrap"><table><tr><th>User ID</th><th>Joined</th><th>Last active</th><th>Files</th><th>Run</th><th>Subscription</th><th>Actions</th></tr>`+(D.users.filter(u=>String(u.id).includes(Q)).map(u=>`<tr><td>${u.id}</td><td>${esc(u.joined)}</td><td>${esc(u.last)}</td><td>${u.files}</td><td>${u.running}</td><td><b>${esc(u.plan||'Free')}</b><br><small>${esc(u.expiry||'No expiry')}</small></td><td>${u.banned?`<button class="a g" onclick="act({action:'unban',user_id:${u.id}})">Unban</button>`:`<button class="a r" onclick="act({action:'ban',user_id:${u.id}})">Ban</button>`} <button class="a" onclick="act({action:'stop_user',user_id:${u.id}})">Stop bots</button><div class="row" style="margin-top:6px"><select id="plan-${u.id}"><option>Free</option><option>Starter</option><option>Pro</option><option>Business</option><option>Premium</option></select><input id="days-${u.id}" type="number" min="1" max="3650" value="30" style="width:70px" title="Days"><button class="a b" onclick="assignPlan(${u.id})">Assign</button><button class="a r" onclick="act({action:'remove_plan',user_id:${u.id}})">Remove</button></div></td></tr>`).join('')||'<tr><td colspan=7>No users</td></tr>')+`</table></div>`;
 if(P=='cast')h=`<div class="box"><b>📢 Message all users</b><textarea id="bc" rows="5" placeholder="Write your message..." style="margin:10px 0"></textarea><button class="a b" onclick="cast()">Send to all users</button></div>`;
 if(P=='set')h=`<div class="box"><b>Bot control</b><div class="row" style="margin-top:10px"><button class="a b" onclick="act({action:'lock'})">🔒 Lock / Unlock bot</button><button class="a r" onclick="if(confirm('Stop all bots?'))act({action:'stop_all'})">🛑 Stop ALL bots</button></div></div><div class="box"><b>Manual ban / unban</b><div class="row" style="margin-top:10px"><input id="uid" placeholder="User ID" inputmode="numeric"><button class="a r" onclick="m('ban')">Ban</button><button class="a g" onclick="m('unban')">Unban</button></div></div>`;
 $('view').innerHTML=h;const i=document.querySelector('#view input[oninput]');if(i&&Q){i.focus();i.setSelectionRange(Q.length,Q.length)}}
+function assignPlan(u){const p=$('plan-'+u).value,d=Number($('days-'+u).value);if(p==='Free'){act({action:'remove_plan',user_id:u});return}if(!Number.isInteger(d)||d<1||d>3650)return toast('Duration must be 1–3650 days',false);act({action:'assign_plan',user_id:u,plan:p,days:d})}
 function m(a){const u=$('uid').value.trim();if(!u)return toast('User ID daalo',false);act({action:a,user_id:u})}
 function cast(){const t=$('bc').value.trim();if(!t)return toast('Write a message',false);if(confirm('Send to everyone?')){act({action:'broadcast',text:t});$('bc').value=''}}
 async function load(){try{D=await (await fetch('/admin/api')).json();const a=document.activeElement;if(a&&(a.tagName=='TEXTAREA'||a.id=='uid'))return;render()}catch(e){$('st').textContent='Load error'}}
@@ -3388,6 +3700,20 @@ async def _notify_owner_storage_status():
     except Exception:
         pass
 
+async def fleet_alert_loop():
+    """Notify customers when bounded crash recovery gives up on a bot."""
+    while True:
+        try:
+            alerts=await asyncio.to_thread(fleet.pending_crashloop_alerts)
+            for item in alerts:
+                try:
+                    await bot.send_message(int(item['owner_id']),
+                        f"⚠️ Your hosted bot <b>{html.escape(item['name'])}</b> repeatedly crashed and was paused.\n"
+                        f"Open /mybots → Logs to inspect the error, then fix the file and restart it.\nDeveloped by Marvel",parse_mode="HTML")
+                except Exception as e: logger.warning("Could not deliver fleet crash alert: %s",e)
+        except Exception as e: logger.warning("Fleet alert monitor failed: %s",e)
+        await asyncio.sleep(45)
+
 async def keep_alive():
     """Pings itself so the Render free service does not go to sleep"""
     url = os.getenv('RENDER_EXTERNAL_URL')
@@ -3424,6 +3750,11 @@ async def web_server():
 
 async def main():
     logger.info("🚀 Starting Advanced File Host Bot...")
+    try:
+        restored_fleet = await asyncio.to_thread(fleet.restore_running)
+        logger.info(f"Restored {restored_fleet} fleet bot(s)")
+    except Exception as e:
+        logger.error(f"Fleet recovery failed: {e}", exc_info=True)
     
     background = [
         asyncio.create_task(web_server()),
@@ -3432,12 +3763,17 @@ async def main():
         asyncio.create_task(monitor_scripts()),
         asyncio.create_task(restore_running_scripts()),
         asyncio.create_task(_notify_owner_storage_status()),
+        asyncio.create_task(fleet_alert_loop()),
     ]
 
         # Render sends SIGTERM before a redeploy: save everything to MongoDB first
     async def _graceful_shutdown():
         logger.info("Shutdown signal received - saving data to cloud storage...")
         await asyncio.to_thread(persist.flush)
+        try:
+            await asyncio.to_thread(fleet.close)
+        except Exception as e:
+            logger.warning(f"Fleet shutdown error: {e}")
         await dp.stop_polling()
 
     loop = asyncio.get_running_loop()
